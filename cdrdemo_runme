@@ -1,0 +1,3195 @@
+#!/bin/bash
+#
+
+export       WORKDIR=../cdrdemo_run
+export DELTA_CONFIGS="${WORKDIR}/delta_configs"
+export     CONFLUENT=~/confluent
+
+mkdir -p ${WORKDIR} 2>/dev/null
+
+lastCmd=" "
+DT=`date +"%Y%m%d-%H%M"`
+DT2=`date +"%H%M"`
+USERNAME=`whoami`
+STARTDIR=`pwd`
+HOSTNAME=`hostname`
+
+# after generating Cloud configs, read the env variables to connect to the Confluent Cloud broker
+
+export PATH=$CONFLUENT/bin:$PATH
+ksql='ksql |grep -v Copyright|grep -v "located at http"|grep -v "Having trouble?"'
+menu=l0_main
+
+Gre='\e[0;32m';
+Red='\e[0;31m';
+#Reset color
+RC='\e[0m'
+RESET='\e[0m'
+
+# for CDR Demo
+THREADS='01 02 03 04 05'
+export DT=`date "+%y%m%d%H%M"`
+export NAME=cdr_source
+export TOPIC=CDR_${DT}
+export DT3=`date "+%Y%m%d-%H%M%S"`
+FINISHED_STRING=""
+
+
+#if [ "$HOSTNAME" = "marks-MacBook.local" -o "$HOSTNAME" = "marks-MacBook" -o "$HOSTNAME" = "marks-macbook.lan" ]
+#then
+#  echo "Setting Env... "; sleep 1
+#  export Bootstrap_Servers=localhost
+#  export Schema_Registry=http://localhost:8081/
+#  export Connect_Server=localhost
+#  export STARTDIR=/Users/markteehan
+#  export PRIMEDIR=${STARTDIR}/Dropbox/sync/Scripts/27_RuleThemAll/prime
+#  export QUEUEDIR=${STARTDIR}/data/GDELT/events/queued
+#  export PRIMEFILE=one.csv
+#  export SPOOLDIR_JAR=${STARTDIR}/Downloads/kafka-connect-spooldir/target/plugins/packages/jcustenborder-kafka-connect-spooldir-1.0-SNAPSHOT-plugin/jcustenborder-kafka-connect-spooldir-1.0-SNAPSHOT/lib
+#  export TWITTER_JAR=${STARTDIR}/Downloads/twitter_connector/jcustenborder-kafka-connect-twitter-0.2.32
+#  export GCP_JSON=${HOME}/Downloads/Sales-Engineering-738930bb7998.json
+#  export OF=1     # offset for the events to load. Incease this to avoid reloading the same events
+#  export IT=1     # number of iterations for auto-loading
+#  export P_INTERVAL_SECS=5
+#  export KAFKA_CONNECT_DEBUG=NO
+#  export PAR=4
+#  export COMPRESSION=NONE    # default topic compression
+#  export CS=01   # startup Connect server number
+#  export CGID=A  # Kafka Connect Group ID
+#  export C_LOGLEVEL=INFO
+#  export DATA_DIR=${HOME}/data/GDELT/events/monthly
+#  export CLUSTERED=N
+##  export SQLITE_DATAFILE=~/Downloads/sqlite_kafka_datafile.dbf
+#fi
+#
+#
+setPar()
+{
+  F=$WORKDIR/settings.txt
+  cat ${F}|grep -v ${1}> ${F}.1 ; mv ${F}.1 ${F}
+  echo "${1} ${2}">> $F
+}
+
+
+getPar()
+{
+  F=$WORKDIR/settings.txt
+  touch ${F}
+  if [[ `grep ${1} $F|wc -l` -gt 0 ]]
+  then
+     echo `grep ${1} $F|awk '{print $2}'`
+  else
+     cat ${F}|grep -v ${1}> ${F}.1 ; mv ${F}.1 ${F}
+     echo "${1} ${2}">> $F
+  fi
+}
+
+
+Pause()
+{
+  echo;echo
+  echo "Hit <return>"
+  read Paused
+}
+checkGCPProject()
+{
+
+  GCP_PROJECT_RAW=`gcloud config list --format 'value(core.project)'|head -1`
+  if [ "$?" -eq 0 ]
+  then
+       export GCP_PROJECT_UP=Y
+       export GCP_PROJECT=${GCP_PROJECT_RAW}
+ else
+       export GCP_PROJECT_UP=N
+       export GCP_PROJECT="None"
+ fi
+}
+
+
+countEvents()
+{
+  dirs="monthly fifteenmins"
+  for i in `echo ${dirs}`
+  do
+   cd ${DATA_DIR}/../${i}
+   LAST_FILE=`ls -tr1|tail -1`
+   if [ "${LAST_FILE}" = "linecount.txt" ]
+   then
+     # only recount if there is newer data than the last count file linecount.txt
+     Do_nothing=DoNothing
+   else
+     nohup sh recount.sh & >> ${WORKDIR}/data_recount_${i}.txt
+   fi
+  done
+  MON_COUNT=`cat ${DATA_DIR}/../monthly/linecount.txt`
+  FIFTEENMINS_COUNT=`cat ${DATA_DIR}/../fifteenmins/linecount.txt`
+  GDELT_TOTAL_COUNT=$(($MON_COUNT+$FIFTEENMINS_COUNT))
+}
+
+##############################################################
+## CDR Demo Start
+##############################################################
+
+getConnectPort()
+{
+  BASE=8080
+  PORT=$1
+  echo $((BASE + PORT))
+}
+setLogLocation()
+{
+    mkdir -p ${WORKDIR} 2>/dev/null
+    export LDIR=${WORKDIR}/${DT3}
+    mkdir -p ${LDIR}
+    echo "(I) Log dir is ${LDIR}"
+}
+
+setBroker()
+{
+cat <<EOF
+**************************************
+**                                  **
+**             brokers              **
+**                                  **
+**************************************
+
+Please choose the broker type:
+1. Confluent Cloud
+2. Confluent 5.4 Multi-region (unavailable)
+3. Confluent Operator (not implemented yet)
+
+Enter 1,2 or 3 (Defaulting to 1. Confluent Cloud)
+EOF
+#read WhichBroker
+WhichBroker=1
+
+case ${WhichBroker} in
+1) BROKERTYPE=CCE
+   ;;
+2) BROKERTYPE=CP54
+   ;;
+3) BROKERTYPE=OP
+   ;;
+*) exit 255
+   ;;
+esac
+
+if [ "$BROKERTYPE" = "CCE" ]
+then
+  export BS=${P_CC_BOOTSTRAP_SERVERS}
+  BROKER_AUTH_FILE=$DELTA_CONFIGS/ak-tools-ccloud.delta
+  export DOCKER_REL=${P_DOCKER_REL}
+  BROKERS=
+fi
+
+if [ "$BROKERTYPE" = "CP54" ] 
+then
+  #ensure that the brokers are in your local hosts file
+  export BS=cdr-demo-1.c.sales-engineering-206314.internal:9092
+  BROKER_AUTH_FILE=cp54.properties
+  BROKERLIST='0 1 2'
+  export DOCKER_REL=cp54_16     #TAG
+fi
+
+if [ "$BROKERTYPE" = "OP" ]
+then
+  export BS=kafka:9071
+  BROKER_AUTH_FILE=
+  BROKERLIST='0 1 2 3'
+  export DOCKER_REL=OP   #TAG
+fi
+}
+
+deleteCCTopics()
+{
+  echo "(I) deleteCCTopics"
+  case "$BROKERTYPE" in
+    "CCE") kafka-topics --bootstrap-server ${BS} --command-config ${BROKER_AUTH_FILE} --list|grep $1 > /tmp/CCE_deleteme_topics
+        sed -i BAK "s#^#kafka-topics --bootstrap-server ${BS} --command-config ${BROKER_AUTH_FILE} --delete --topic #g" /tmp/CCE_deleteme_topics
+        if [ `cat /tmp/CCE_deleteme_topics|wc -l|sed "s/ //g"` -gt 0 ]
+        then
+          echo;echo;echo; echo "(I) About to delete these topics:"
+          cat /tmp/CCE_deleteme_topics
+          sleep 5
+          sh /tmp/CCE_deleteme_topics
+        fi
+        ;;
+    "OP") Nothing=nothing # dont bother deleting from OP clusters as the brokers will be destroyed between tests
+        ;;
+  "CP54") kafka-topics --bootstrap-server ${BS} --list|grep $1 > /tmp/CCE_deleteme_topics
+          sed -i BAK "s#^#kafka-topics --bootstrap-server ${BS}  --delete --topic #g" /tmp/CCE_deleteme_topics
+        echo;echo;echo; echo "(I) About to delete these topics:"
+        cat /tmp/CCE_deleteme_topics
+        sleep 5
+        sh /tmp/CCE_deleteme_topics
+  esac
+}
+
+
+
+makeCluster()
+{
+  # make docker images for OP, CP54 and CC
+  export DT3=`date "+%Y%m%d-%H%M%S"`
+    cd ${STARTDIR}/files
+    make -f Makefile gke-create-cluster | tee -a ${LDIR}/gke-create-cluster
+    cd ${STARTDIR}
+    RC=$?
+    if [ "$RC" -gt 0 ]
+    then
+      echo "(E) make -f Makefile cmd returned ${RC} - check and rerun!"
+      exit 255
+    fi
+    cd ${STARTDIR}/files
+    make -f Makefile demo | tee -a ${LDIR}/make_demo
+    cd ${STARTDIR}
+}
+
+
+
+recreatePortForwards()
+{
+  echo "(I) recreatePortForwards for $GKE_BASE_CONNECT_REPLICAS Connect Worker nodes"
+  for i in $(seq 0 $GKE_BASE_CONNECT_REPLICAS)
+  do
+    C_PORT=$(getConnectPort $i)
+    PID=`lsof -i:${C_PORT}|tail -1 | awk '{print $2}'`
+    if [ "$PID"x = x ]
+    then
+      echo "killed port ${C_PORT}" >> ${LDIR}/port_forward_killed
+    else
+      echo "no port forward process found for ${C_PORT}" >> ${LDIR}/port_forward_skipped
+      kill -9 ${PID}
+    fi
+  done
+
+  for i in $(seq 0 ${GKE_BASE_CONNECT_REPLICAS})
+  do
+    C_PORT=$(getConnectPort $i)
+    echo nohup kubectl -n democluster port-forward connectors-${i} ${C_PORT}:8083 >>nohup.out
+    nohup kubectl -n democluster port-forward connectors-${i} ${C_PORT}:8083 &
+    RC=$?
+    if [ "$RC" -eq 0 ]
+    then
+      echo kubectl -n democluster port-forward connectors-${i} ${C_PORT}:8083 >> ${LDIR}/port_forwarding
+    else
+      echo kubectl -n democluster port-forward connectors-${i} ${C_PORT}:8083 >> ${LDIR}/port_forwarding_error
+    fi
+  done
+  nohup kubectl -n democluster port-forward controlcenter-0 9121:9021 &
+  nohup kubectl -n democluster port-forward kafka-0 9071:9071 &
+  echo > ${LDIR}/port_forwarding_done
+}
+
+deleteConnectJobs()
+{
+  echo "(I) deleting connnect jobs.."
+  for i in $(seq 0 $GKE_BASE_CONNECT_REPLICAS);
+  do
+    for j in `curl -s -X GET localhost:808${i}/connectors/|grep cdr|sed "s/\[//"|sed "s/\]//"|sed 's/"//g'|sed 's/,/ /g'`
+    do
+        echo deleting kafka connect job $j on connectors-${i}
+        curl  -X DELETE localhost:808${i}/connectors/$j
+        runSleep 3
+    done
+  done
+  echo "(I) finished deleting connnect jobs.."
+}
+
+
+createTopic()
+{
+ echo "(I) createTopic"
+ export DT3=`date "+%Y%m%d-%H%M%S"`
+ export BS=${P_CC_BOOTSTRAP_SERVERS}
+ BROKER_PROPERTIES=admin.properties.${DT3}
+ cp $DELTA_CONFIGS/ak-tools-ccloud.delta ${BROKER_PROPERTIES}
+   
+ sed -iBAK "s#\\\##g" ${BROKER_PROPERTIES}
+ kafka-topics --bootstrap-server ${BS} --command-config ${BROKER_PROPERTIES} --create --topic $TOPIC --replication-factor 3 --partitions 10
+ kafka-topics --bootstrap-server ${BS} --command-config ${BROKER_PROPERTIES} --list|grep $TOPIC > ${LDIR}/check_topic
+
+  LINES=`cat ${LDIR}/check_topic|wc -l|sed 's/ //g'`
+  if [ "$LINES" = "0" ]
+  then
+    echo "cannot find topic! pausing. Run this to continue, and kill the sleep 1000"
+    echo kubectl -n democluster exec -it client-console bash
+    echo kafka-topics --bootstrap-server ${BS} --command-config ${BROKER_PROPERTIES} --create --topic $TOPIC --replication-factor 3 --partitions 10
+    sleep 1000
+  fi
+  rm -f admin.properties.${DT3}
+}
+
+streamConnectLogFileMultiplexed()
+{
+  for i in $(seq 0 ${GKE_BASE_CONNECT_REPLICAS})
+  do
+    nohup kubectl -n democluster logs -f connectors-${i} >> ${LDIR}/connector-pod-logfiles &
+  done
+}
+
+
+submitConnectJob()
+{
+  echo "(I) submitConnectJob"
+  TOPIC=$1
+  THREAD=$2
+  LDIR=$3
+  # submit the job to the Connect Server specified from the menu option.
+
+  schema_generation_key_fields="state"
+  schema_generation_key_name="cdr.key"
+  schema_generation_value_name="cdr.value"
+  csv_separator_char="44"
+  FILE_PATH="/var/tmp"
+  key_schema='{\"name\":\"com_cdr_Key\",\"type\":\"STRUCT\",\"isOptional\":false,\"fieldSchemas\":{\"state\":{\"type\":\"STRING\",\"isOptional\":false}}}'
+
+  value_schema='{\"name\":\"com_cdr_value\",\"type\":\"STRUCT\",\"isOptional\":false,\"fieldSchemas\":{ \"state\":{\"type\":\"STRING\",\"isOptional\":false} , \"mod_id\":{\"type\":\"STRING\",\"isOptional\":true} , \"protocol\":{\"type\":\"STRING\",\"isOptional\":true} , \"flags\":{\"type\":\"STRING\",\"isOptional\":true} , \"accounting_reason\":{\"type\":\"STRING\",\"isOptional\":true} , \"proto_id\":{\"type\":\"STRING\",\"isOptional\":true} , \"imsi\":{\"type\":\"STRING\",\"isOptional\":true} , \"msisdn\":{\"type\":\"STRING\",\"isOptional\":true} , \"imei\":{\"type\":\"STRING\",\"isOptional\":true} , \"appid\":{\"type\":\"STRING\",\"isOptional\":true}'
+
+value_schema=$value_schema', \"rat_type\":{\"type\":\"STRING\",\"isOptional\":true} , \"net_type\":{\"type\":\"STRING\",\"isOptional\":true} , \"gprs_device_id\":{\"type\":\"STRING\",\"isOptional\":true} , \"flow_device_id\":{\"type\":\"STRING\",\"isOptional\":true} , \"os\":{\"type\":\"STRING\",\"isOptional\":true} , \"browser_id\":{\"type\":\"STRING\",\"isOptional\":true} , \"node_id1\":{\"type\":\"STRING\",\"isOptional\":true} , \"node_id2\":{\"type\":\"STRING\",\"isOptional\":true},\"node_id3\":{\"type\":\"STRING\",\"isOptional\":true} , \"node_addr1\":{\"type\":\"STRING\",\"isOptional\":true} , \"node_addr2\":{\"type\":\"STRING\",\"isOptional\":true} , \"node_addr3\":{\"type\":\"STRING\",\"isOptional\":true} , \"client_ip\":{\"type\":\"STRING\",\"isOptional\":true} , \"client_port\":{\"type\":\"STRING\",\"isOptional\":true} , \"server_ip\":{\"type\":\"STRING\",\"isOptional\":true} , \"server_port\":{\"type\":\"STRING\",\"isOptional\":true} , \"vol_in\":{\"type\":\"STRING\",\"isOptional\":true}'
+
+  value_schema=$value_schema' , \"vol_out\":{\"type\":\"STRING\",\"isOptional\":true} , \"rxmit_vol_in\":{\"type\":\"STRING\",\"isOptional\":true} , \"rxmit_vol_out\":{\"type\":\"STRING\",\"isOptional\":true} , \"pkt_in\":{\"type\":\"STRING\",\"isOptional\":true} , \"pkt_out\":{\"type\":\"STRING\",\"isOptional\":true} , \"rxmit_pkt_in\":{\"type\":\"STRING\",\"isOptional\":true} , \"rxmit_pkt_out\":{\"type\":\"STRING\",\"isOptional\":true} , \"pkt_iat_in\":{\"type\":\"STRING\",\"isOptional\":true} , \"pkt_iat_out\":{\"type\":\"STRING\",\"isOptional\":true} , \"first_seen_in\":{\"type\":\"STRING\",\"isOptional\":true} , \"first_seen_out\":{\"type\":\"STRING\",\"isOptional\":true} , \"last_seen_in\":{\"type\":\"STRING\",\"isOptional\":true} , \"last_seen_out\":{\"type\":\"STRING\",\"isOptional\":true} , \"reorder_pkt\":{\"type\":\"STRING\",\"isOptional\":true} , \"first_seen\":{\"type\":\"STRING\",\"isOptional\":true} , \"last_seen\":{\"type\":\"STRING\",\"isOptional\":true} , \"record_duration\":{\"type\":\"STRING\",\"isOptional\":true} , \"client_delay\":{\"type\":\"STRING\",\"isOptional\":true}'
+
+  value_schema=$value_schema' , \"first_data_delay\":{\"type\":\"STRING\",\"isOptional\":true} , \"std\":{\"type\":\"STRING\",\"isOptional\":true} , \"signalling_triggered\":{\"type\":\"STRING\",\"isOptional\":true} , \"input_port_bitmap\":{\"type\":\"STRING\",\"isOptional\":true} , \"location_type\":{\"type\":\"STRING\",\"isOptional\":true} , \"service_option\":{\"type\":\"STRING\",\"isOptional\":true} , \"teid1\":{\"type\":\"STRING\",\"isOptional\":true} , \"teid2\":{\"type\":\"STRING\",\"isOptional\":true} , \"perf_flags\":{\"type\":\"STRING\",\"isOptional\":true} , \"reorder_vol\":{\"type\":\"STRING\",\"isOptional\":true} , \"rxmit_pkt\":{\"type\":\"STRING\",\"isOptional\":true} , \"tcp_stamp_src\":{\"type\":\"STRING\",\"isOptional\":true} , \"max_idle\":{\"type\":\"STRING\",\"isOptional\":true} , \"pdp_ctx_activation_time\":{\"type\":\"STRING\",\"isOptional\":true} , \"network_delay\":{\"type\":\"STRING\",\"isOptional\":true} , \"subengine_num\":{\"type\":\"STRING\",\"isOptional\":true} , \"nas_node_id\":{\"type\":\"STRING\",\"isOptional\":true} , \"calling_station_id\":{\"type\":\"STRING\",\"isOptional\":true} , \"called_station_id\":{\"type\":\"STRING\",\"isOptional\":true} , \"nas_ip\":{\"type\":\"STRING\",\"isOptional\":true} , \"apn\":{\"type\":\"STRING\",\"isOptional\":true} , \"remote_apn\":{\"type\":\"STRING\",\"isOptional\":true} , \"location\":{\"type\":\"STRING\",\"isOptional\":true} , \"cell_mccmnc\":{\"type\":\"STRING\",\"isOptional\":true} , \"imsi_mccmnc\":{\"type\":\"STRING\",\"isOptional\":true} , \"pcf_ip\":{\"type\":\"STRING\",\"isOptional\":true}'
+
+  value_schema=$value_schema' , \"proxy_endpoint\":{\"type\":\"STRING\",\"isOptional\":true} , \"tcp_stamp_time\":{\"type\":\"STRING\",\"isOptional\":true} , \"teid_match_info\":{\"type\":\"STRING\",\"isOptional\":true} , \"vlan\":{\"type\":\"STRING\",\"isOptional\":true} , \"client_ip_ttl\":{\"type\":\"STRING\",\"isOptional\":true} , \"flow_id\":{\"type\":\"STRING\",\"isOptional\":true} , \"session_id\":{\"type\":\"STRING\",\"isOptional\":true} , \"test1\":{\"type\":\"STRING\",\"isOptional\":true} , \"test2\":{\"type\":\"STRING\",\"isOptional\":true} } }'
+
+
+  F=/tmp/connect.spooldir.worker.cmd
+  #,"producer.confluent.monitoring.interceptor.security.protocol":"SASL_SSL"
+  #,"producer.confluent.monitoring.interceptor.ssl.endpoint.identification.algorithm":"https"
+  #,"producer.confluent.monitoring.interceptor.sasl.mechanism":"PLAIN"
+  #DELETEME,"sasl.jaas.config":"org.apache.kafka.common.security.plain.PlainLoginModule required username=\"4BDMVTJX364RO6AY\" password=\"6s7JlhUGdyCR/5fFmC+MjrQAOmSmOrdczgfiHqP39EhjbBJcpjq90TM1Y16Ju4KQ\";"
+
+  export DT4=`date "+%Y%m%d%H%M%S"`
+  cat <<EOF > ${F}
+  { "name": "REPLACEME_NAME","config":{
+   "consumer.interceptor.classes":"io.confluent.monitoring.clients.interceptor.MonitoringConsumerInterceptor"
+  ,"producer.interceptor.classes":"io.confluent.monitoring.clients.interceptor.MonitoringProducerInterceptor"
+  ,"producer.confluent.monitoring.interceptor.request.timeout.ms":"20000"
+  ,"producer.confluent.monitoring.interceptor.retry.backoff.ms":"10000"
+  ,"sasl.mechanism":"PLAIN"
+  ,"sasl.jaas.config":"REPLACEME_SASLJAAS_CONFIG"
+  ,"producer.confluent.monitoring.interceptor.security.protocol":"SASL_SSL"
+  ,"producer.confluent.monitoring.interceptor.ssl.endpoint.identification.algorithm":"https"
+  ,"producer.confluent.monitoring.interceptor.sasl.mechanism":"PLAIN"
+  ,"producer.confluent.monitoring.interceptor.sasl.jaas.config":"REPLACEME_SASLJAAS_CONFIG"
+  ,"topic":"${TOPIC}"
+  ,"connector.class": "com.github.jcustenborder.kafka.connect.spooldir.SpoolDirCsvSourceConnector"
+  ,"auto.register.schemas":"true"
+  ,"errors.log.enable":"true"
+  , "input.file.pattern":"^.*REPLACEME_THREAD.txt$"
+  ,         "key.ignore": "true"
+  ,          "tasks.max": "1"
+  ,      "schema.ignore": "false"
+  ,          "type.name": "kafka-connect"
+  ,         "batch.size": "10000"
+  ,           "group.id":"REPLACEME_GROUP"
+  ,"schema.generation.enabled":"true"
+  ,"schema.generation.key.fields":"${schema_generation_key_fields}"
+  ,  "schema.generation.key.name":"${schema_generation_key_name}"
+  ,"schema.generation.value.name":"${schema_generation_value_name}"
+  ,    "csv.null.field.indicator":"EMPTY_SEPARATORS"
+  ,          "empty.poll.wait.ms":"5000"
+  ,     "csv.first.row.as.header":"false"
+  ,          "csv.separator.char":"${csv_separator_char}"
+  ,        "input.path":"${FILE_PATH}/queued"
+  ,        "error.path":"${FILE_PATH}/error"
+  ,     "finished.path":"${FILE_PATH}/processed"
+  ,        "key.schema":"${key_schema}"
+  ,      "value.schema":"${value_schema}"
+  ,   "key.converter": "org.apache.kafka.connect.storage.StringConverter"
+  ,   "value.converter": "io.confluent.connect.avro.AvroConverter"
+  ,   "value.converter.schemas.enable": "true"
+  ,   "value.converter.schema.registry.url": "REPLACEME_SCHEMAREGISTRYURL"
+  ,   "value.converter.basic.auth.credentials.source":"USER_INFO"
+  ,   "value.converter.schema.registry.basic.auth.user.info":"REPLACEME_SCHEMAREGISTRYAUTH"
+  } }
+EOF
+
+  echo "Submitting Spooldir jobs for thread ${THREAD} on each Connect pod to load from ${FILE_PATH}/queued"
+
+  for i in $(seq 0 ${GKE_BASE_CONNECT_REPLICAS})
+  do
+    DT3=`date "+%Y%m%d-%H%M%S"`
+    JOBNAME=t${THREAD}_${NAME}_${DT3}
+    cp ${F} ${F}.this
+    sed -i bak "s/REPLACEME_NAME/$JOBNAME/g" ${F}.this
+    sed -i bak "s/REPLACEME_THREAD/$THREAD/g" ${F}.this
+    sed -i bak "s/REPLACEME_GROUP/GRP${THREAD}/g" ${F}.this
+    sed -i bak "s/REPLACEME_SASLJAAS_CONFIG/${SASL_JAAS_CONFIG_PROPERTY_FORMAT}/g" ${F}.this
+    sed -i bak "s/REPLACEME_SCHEMAREGISTRYURL/${SCHEMA_REGISTRY_URL}/g" ${F}.this
+    sed -i bak "s/REPLACEME_SCHEMAREGISTRYAUTH/${BASIC_AUTH_CREDENTIALS_SOURCE}/g" ${F}.this
+    #each job has a different group.id so they should run isolated
+    C_PORT=$(getConnectPort $i)
+    URL="http://localhost:${C_PORT}/connectors/"
+    cat ${F}.this > ${LDIR}/connect${i}.submit.log
+    cat ${F}.this | curl -s -X "POST" "${URL}" -H "Content-Type: application/json" -d "$(</dev/stdin)" 1>>${LDIR}/connect${i}.submit.log 2>&1
+    RC=$?
+    if [ "$RC" -eq 0 ]
+    then
+      #echo ".. connect${i} loading filenames "^.*${THREAD}.txt" $JOBNAME  : return code = success"
+      echo ".. connect${i} loading filenames "^.*${THREAD}.txt" $JOBNAME  : return code = success" >> ${LDIR}/connect.submit.success.log
+    else
+      echo ".. connect${i} loading filenames "^.*${THREAD}.txt" $JOBNAME  : return code = FAIL ${RC}"
+      echo ".. connect${i} loading filenames "^.*${THREAD}.txt" $JOBNAME  : return code = FAIL ${RC}" >> ${LDIR}/connect.submit.FAIL.log
+    fi
+    cat ${LDIR}/connect${i}.submit.log >> ${LDIR}/connect.submit.log
+    rm ${LDIR}/connect${i}.submit.log
+  done
+}
+
+
+startConnectJobs()
+{ 
+  echo "(I) startConnectJobs"
+  #THREADS sets the parallelism for each connect worker. Currently fixed at 5. (01,02,03,04,05)
+  for i in `echo ${THREADS}`
+  do
+    submitConnectJob ${TOPIC} ${i} ${LDIR}
+  done
+}
+
+createKsql()
+{
+  echo "(I) Creating kSQL stream and tables"
+  kubectl -n democluster exec -it ksql-0 bash <<EOF   >${LDIR}/ksql_create_streams
+  cd /tmp
+  echo "CREATE STREAM ${TOPIC}_st (state STRING, mod_id STRING, protocol STRING, flags STRING, accounting_reason STRING, proto_id STRING, imsi STRING, msisdn STRING, imei STRING, appid STRING, rat_type STRING, net_type STRING, gprs_device_id STRING, flow_device_id STRING, os STRING, browser_id STRING, node_id1  STRING, node_id2 STRING,node_id3  STRING, node_addr1 STRING, node_addr2 STRING, node_addr3 STRING, client_ip STRING, client_port STRING, server_ip STRING, server_port STRING, vol_in STRING, vol_out STRING, rxmit_vol_in STRING, rxmit_vol_out STRING, pkt_in STRING, pkt_out STRING, rxmit_pkt_in STRING, rxmit_pkt_out STRING, pkt_iat_in STRING, pkt_iat_out STRING, first_seen_in STRING, first_seen_out STRING, last_seen_in STRING, last_seen_out STRING, reorder_pkt STRING, first_seen STRING, last_seen STRING, record_duration STRING, client_delay STRING, first_data_delay STRING, std STRING, signalling_triggered STRING, input_port_bitmap STRING, location_type STRING, service_option STRING, teid1 STRING, teid2 STRING, perf_flags STRING, reorder_vol STRING, rxmit_pkt STRING, tcp_stamp_src STRING, max_idle STRING, pdp_ctx_activation_time STRING, network_delay STRING, subengine_num STRING, nas_node_id  STRING, calling_station_id STRING, called_station_id STRING, nas_ip STRING, apn STRING, remote_apn STRING, location STRING, cell_mccmnc STRING, imsi_mccmnc STRING, pcf_ip STRING, proxy_endpoint STRING, tcp_stamp_time STRING, teid_match_info STRING, vlan STRING, client_ip_ttl STRING, flow_id STRING, session_id STRING, test1 STRING, test2 STRING) WITH (KAFKA_TOPIC='$TOPIC', VALUE_FORMAT='AVRO');" | ksql
+
+  echo "CREATE STREAM ${TOPIC}_02_st as SELECT *, ROWTIME as C_ROWTIME FROM ${TOPIC}_st;" | ksql
+
+  echo "CREATE STREAM ${TOPIC}_02_st as SELECT state,mod_id,protocol,flags,accounting_reason, ROWTIME as C_ROWTIME FROM ${TOPIC}_st;" | ksql
+
+  echo "CREATE STREAM ${TOPIC}_03_st as SELECT * FROM ${TOPIC}_02_st PARTITION BY state;" | ksql
+
+  echo "CREATE TABLE ${TOPIC}_04_tb AS SELECT state as C_STATE, cast(Count(*) as bigint) as C_COUNT, MAX(C_ROWTIME) as C_MAX_TS FROM ${TOPIC}_03_st GROUP BY state;" | ksql
+
+  echo "CREATE STREAM ${TOPIC}_05_st WITH (KAFKA_TOPIC='${TOPIC}_04_tb', VALUE_FORMAT='AVRO');
+
+ echo "CREATE STREAM ${TOPIC}_06_st AS SELECT state,C_COUNT as STATE_COUNT,calling_station_id,cell_mccmnc FROM ${TOPIC}_03_st JOIN ${TOPIC}_05_st WITHIN 60 MINUTES on STATE=C_STATE WHERE C_ROWTIME=MAX_TS;
+
+  echo "DESCRIBE EXTENDED ${TOPIC}__06_st;" | ksql
+  echo "SHOW TABLES;" | ksql
+  echo "SHOW STREAMS;" | ksql
+EOF
+}
+
+
+checkTestData()
+{
+  echo "(I) Check Test Data"
+  export DT3=`date "+%Y%m%d-%H%M%S"`
+  F=${LDIR}/CDR-files-processed_${DT3}
+  echo >> ${F}
+  echo >> ${F}
+  echo >> ${F}
+  echo ${DT3} >> ${F}
+  echo "------------------------" >>  ${F}
+
+  for i in $(seq 0 ${GKE_BASE_CONNECT_REPLICAS})
+  do
+    kubectl -n democluster exec -it connectors-${i} bash > ${LDIR}/checkTestData-rel02_connectors${i}_${DT3} 2>&1 <<EOF
+     cd /var/tmp/processed ;printf "processed " ; find . |wc -l
+     cd /var/tmp/error     ;printf "    error " ; find . |wc -l
+     cd /var/tmp/queued    ;printf "   queued " ; find . |wc -l
+EOF
+  done
+  for i in $(seq 0 ${GKE_BASE_CONNECT_REPLICAS})
+  do
+    A1=`cat ${LDIR}/checkTestData-rel02_connectors${i}_${DT3}|grep processed|awk '{print \$2}'`
+    A2=`cat ${LDIR}/checkTestData-rel02_connectors${i}_${DT3}|grep     error|awk '{print \$2}'`
+    A3=`cat ${LDIR}/checkTestData-rel02_connectors${i}_${DT3}|grep    queued|awk '{print \$2}'`
+    echo "${i}: Processed=${A1}  Error=${A2}  Queued=${A3}" >> ${F}
+    rm ${LDIR}/checkTestData-rel02_connectors${i}_${DT3}
+  done
+
+  #check if all files have been processed
+  NUM_FINISHED=`cat ${F}|grep -v "Processed=1 "| grep Queued|grep "=1$"|wc -l|sed "s/ //g"`
+  if [ "$GKE_BASE_CONNECT_REPLICAS" -eq "$NUM_FINISHED" ]
+  then
+   export FINISHED_STRING="Last file processed for - all files for ${GKE_BASE_CONNECT_REPLICAS} connect nodes have been processed. Exiting"
+  fi
+}
+
+
+runSleep()
+{
+  #touch ${LDIR}/`date "+%Y%m%d-%H%M%S"`_sleep_${1}
+  sleep $1
+}
+checkKsql()
+{
+  echo "(I) check ksql"
+  export DT5=`date "+%Y%m%d-%H%M%S"`
+  kubectl -n democluster exec -it ksql-0 bash <<EOF   >${LDIR}/ksql_check_${DT5} 2>&1
+   cd /tmp
+   export KSQL_OPTS="-Dksql.streams.auto.offset.reset=earliest"
+   echo "SELECT * FROM  ${TOPIC}_06_st LIMIT 10;" | ksql
+   exit;
+EOF
+}
+
+getConnectRowsProcessed()
+{
+  echo "(I) get Connect Rows Processed"
+  export DT3=`date "+%Y%m%d-%H%M%S"`
+
+   ROWS=`cat ${LDIR}/connector-pod-logfiles|grep "SourceTask recordProcessingTime - Finished processing"| awk '{print $10}' | grep -v "second" |awk '{total = total + $1}END{print total}'`
+  FILES=`cat ${LDIR}/connector-pod-logfiles|grep "SourceTask recordProcessingTime - Finished processing"| wc -l|tail -1|sed "s/ //g"`
+    AVG=`cat ${LDIR}/connector-pod-logfiles|grep "SourceTask recordProcessingTime - Finished processing"| awk '{sum +=$13} END { print "Average-"50000/(sum/NR)}'`
+  touch ${LDIR}/connectRowsProcessed_${DT3}__${ROWS}-events__${FILES}-files__${AVG}-CdrsPerSec
+
+   TTLAVG=`ls -1 ${LDIR}/connectRowsProcessedconnectors*_${DT3}*|grep -v tps|awk -F"__" '{print $4}'|awk -F- '{sum +=$2} END {print sum}'`
+  THISTTL=`ls -1 ${LDIR}/connectRowsProcessedconnectors*_${DT3}*|grep -v tps|sed 's/-events//'|awk -F"__" '{sum +=$2} END {print sum}'`
+
+  START_TS=`grep  Opening ${LDIR}/connector-pod-logfiles|head -1|awk '{print $3}'|awk -F, '{print $1}'`
+    END_TS=`grep Finished ${LDIR}/connector-pod-logfiles|tail -1|awk '{print $3}'|awk -F, '{print $1}'`
+
+  touch ${LDIR}/Finished__${ROWS}_CDRsProcessed__start_${START_TS}__end_${END_TS}
+
+  cat ${LDIR}/connector-pod-logfiles|grep "SourceTask recordProcessingTime - Finished processing" > ${LDIR}/finished_processing
+  AVGAVG1=`cat ${LDIR}/connector-pod-logfiles|grep "SourceTask recordProcessingTime - Finished processing"| awk '{sum +=$13} END { print "Average-"50000/(sum/NR)}'`
+  AVGAVG2=`cat ${LDIR}/connector-pod-logfiles|grep "SourceTask recordProcessingTime - Finished processing"| awk '{sum +=$13} END { print "Average-"(sum/NR)}'`
+  echo "AvgAvg1= ${AVGAVG1} AvgAvg2=${AVGAVG2}"
+  touch ${LDIR}/Finished__avgavg1_${AVGAVG1}__avgavg2_${AVGAVG2}
+  cd ${STARTDIR}
+  rm -f logdir
+  ln -s ${LDIR} logdir
+}
+
+getPodLogfiles()
+{
+  echo "(I) get prod log files"
+  for i in `kubectl get pods -n democluster | awk '{print $1}'|grep -v NAME|grep -i connector`
+  do
+     kubectl -n democluster logs --since=60m  ${i} > ${LDIR}/logs_${i}
+     ERRORS=`cat ${LDIR}/logs_${i}|grep ERROR|wc -l|sed 's/ //g'`
+     if [ "$ERRORS" = "0" ]
+     then
+        a=a
+      else
+         mv ${LDIR}/logs_${i} ${LDIR}/logs_${i}__errors_${ERRORS}
+     fi
+     #kubectl -n democluster exec -it connectors-${j} -- top -n 3 > ${LDIR}/top_${i}_${j}_${DT2}.txt
+     #kubectl -n democluster exec -it connectors-${j} -- ls -lR /var/tmp > ${LDIR}/ls_${i}_${j}_${DT2}.txt
+  done
+}
+
+
+destroyCluster()
+{
+  echo "(I) destroy cluster"
+  export DT3=`date "+%Y%m%d-%H%M%S"`
+    cd ${STARTDIR}/files
+    make -f Makefile destroy-demo | tee -a ${LDIR}/destroy-demo
+    make -f Makefile gke-destroy-cluster | tee -a ${LDIR}/gke-destroy-cluster
+    cd ${STARTDIR}
+}
+
+
+
+
+
+##############################################################
+## CDR Demo End
+##############################################################
+runCDRDemo()
+{
+  setLogLocation
+  date >${LDIR}/started_at
+  setBroker
+  destroyCluster
+  deleteCCTopics connect
+  #deleteCCTopics dc2
+  #deleteCCTopics cdr
+  deleteCCTopics CDR
+  deleteCCTopics _confluent-ksql
+  makeCluster
+  
+  recreatePortForwards
+  
+  deleteConnectJobs
+  createTopic
+  #!#startLoopbackReplicator
+  #streamConnectLogFileMultiplexed
+  startConnectJobs
+  sleep 120
+  #createKsql
+  checkTestData
+  
+  for i in `echo 1 2 3 4 5 6 7 8 9 10 11 12`
+  do
+    if [ "$FINISHED_STRING" = "" ]
+    then
+      runSleep 150
+      checkTestData
+      #checkKsql
+   else
+     echo " "
+     echo " "
+     echo "exiting: Last file processed: ${FINISHED_STRING}"
+     echo "exiting: Last file processed: ${FINISHED_STRING}" > ${LDIR}/last_file_processed
+   fi
+  done
+  #
+  getConnectRowsProcessed
+  getPodLogfiles
+  destroyCluster
+  date > ${LDIR}/finished_at
+  mv nohup.out ${LDIR} 2>/dev/null
+}
+
+
+
+
+
+
+setCdrsPerFile()
+{
+  clear;echo;echo "Set the number of CDR records in each file. It is currently ${P_CDRS_PER_FILE}."
+  echo "Enter the new CDRs per file:"
+  read P_CDRS_PER_FILE
+  echo;echo "Hit Return"
+  setPar P_CDRS_PER_FILE ${P_CDRS_PER_FILE}
+  read Paused
+}
+
+
+getCCloudConfigFiles()
+{
+rm -f /tmp/dockerfile
+cd ${STARTDIR}
+cp templates/connect.dockerfile dockerfile.${DT3}
+RET=$?
+if [ "$RET" -gt 0 ]
+then
+  echo "ERROR: unable to locate templates/connect.dockerfile. Something is wrong: cannot proceed"
+  exit 255
+fi
+
+sed -iBAK "s/REPLACEME_LINGER_MS/${P_LINGER_MS}/g" dockerfile.${DT3}
+sed -iBAK "s/REPLACEME_BUFFER_MEMORY/${P_BUFFER_MEMORY}/g" dockerfile.${DT3}
+sed -iBAK "s/REPLACEME_PRODUCER_COMPRESSION_TYPE/${P_PRODUCER_COMPRESSION}/g" dockerfile.${DT3}
+
+cp templates/genSpoolFiles.sh genSpoolFiles.sh.${DT3}
+sed -iBAK "s/REPLACEME_GENSPOOLFILE/genSpoolFiles.sh.${DT3}/g" dockerfile.${DT3}
+sed -iBAK "s/REPLACEME_LINES/${P_CDRS_PER_FILE}/g" genSpoolFiles.sh.${DT3}
+sed -iBAK "s/REPLACEME_FILES/${P_CDR_FILES}/g" genSpoolFiles.sh.${DT3}
+
+# remove escape slashes before double quotes. Connect dislikes it
+cp $DELTA_CONFIGS/ak-tools-ccloud.delta admin.properties.${DT3}
+sed -iBAK "s#\\\##g" admin.properties.${DT3}
+#cat <<EOF >admin.properties.${DT3}
+#security.protocol=SASL_SSL
+#sasl.mechanism=PLAIN
+#sasl.jaas.config=org.apache.kafka.common.security.plain.PlainLoginModule required username="$CC_USERNAME" password="$CC_PASSWORD";
+#EOF
+chmod 755 admin.properties.${DT3}
+sed -iBAK "s/REPLACEME_ADMIN_PROPERTIES/admin.properties.${DT3}/g" dockerfile.${DT3}
+
+#cp templates/ccloud.properties ccloud.properties.${DT3}
+cp $DELTA_CONFIGS/ak-tools-ccloud.delta ccloud.properties.${DT3}
+sed -iBAK "s/REPLACEME_CCLOUD_PROPERTIES/ccloud.properties.${DT3}/g" dockerfile.${DT3}
+sed -iBAK "s/REPLACEME_CC_BOOTSTRAP_SERVERS/${P_CC_BOOTSTRAP_SERVERS}/g" ccloud.properties.${DT3}
+sed -iBAK "s/REPLACEME_SASL_JAAS_CONFIG/${SASL_JAAS_CONFIG_PROPERTY_FORMAT}/g" ccloud.properties.${DT3}
+cat $DELTA_CONFIGS/connect-ccloud.delta >> ccloud.properties.${DT3}
+sed -iBAK "s#\\\##g" ccloud.properties.${DT3}
+
+}
+
+
+ReBuildDockerImages()
+{
+export  P_DOCKER_REL=`getPar P_DOCKER_REL 0`
+export P_GITHUB_REPO=`getPar P_GITHUB_REPO GITHUB_REPO_UNSET`
+if [ "$P_GITHUB_REPO" = "GITHUB_REPO_UNSET" ]
+then
+  echo "ERROR Set P_GITHUB_REPO in the properties file before building a new docker image"
+  exit 255
+fi
+getCCloudConfigFiles
+P_DOCKER_REL=$(($P_DOCKER_REL+1))
+docker login
+docker build -t ${P_GITHUB_REPO}/cp-kafka-connect-telcodemo-spooldir -f dockerfile.${DT3} .
+     docker tag ${P_GITHUB_REPO}/cp-kafka-connect-telcodemo-spooldir ${P_GITHUB_REPO}/cp-kafka-connect-telcodemo-spooldir:${P_DOCKER_REL}
+    docker push ${P_GITHUB_REPO}/cp-kafka-connect-telcodemo-spooldir:${P_DOCKER_REL}
+RET=$?
+if [ "$RET" -eq 0 ]
+then
+  echo "Docker build, tag, push successful for ${P_GITHUB_REPO}/cp-kafka-connect-telcodemo-spooldir:${P_DOCKER_REL}"
+  echo "This image will be pulled for the next CDR Demo run"
+  setPar P_DOCKER_REL ${P_DOCKER_REL}
+  setPar P_DOCKER_IMAGE_STATUS ok
+  Pause
+else
+  echo "ERROR: docker build for ${P_GITHUB_REPO}/cp-kafka-connect-telcodemo-spooldir:${P_DOCKER_REL} was unsuccessful!"
+  setPar P_DOCKER_IMAGE_STATUS stale
+fi
+mv dockerfile.${DT3} /tmp
+mv ccloud.properties.${DT3} /tmp
+mv admin.properties.${DT3} /tmp
+
+rm genSpoolFiles.sh.${DT3} *BAK
+}
+
+
+setBatchSize()
+{
+  clear;echo;echo "Set batch.size for the Kafka Connect producers. It is currently ${P_BATCH_SIZE}"
+  echo "Enter the new batch.size"
+  read P_BATCH_SIZE
+  echo;echo "Hit Return"
+  setPar P_BATCH_SIZE ${P_BATCH_SIZE}
+  read Paused
+}
+
+setLingerMs()
+{
+  clear;echo;echo "Set linger.ms for the Kafka Connect producers. It is currently ${P_LINGER_MS}"
+  echo "Enter the new linger.ms"
+  read P_LINGER_MS
+  echo;echo "Hit Return"
+  setPar P_LINGER_MS ${P_LINGER_MS}
+  read Paused
+}
+
+setProducerCompression()
+{
+  clear;echo;echo "Set the compression algorithm for Kafka Connect to use - must be one of none, lz4, snappy or gzip. It is currently ${PRODUCER_COMPRESSION}"
+  echo "Enter the new compression algorithm"
+  read P_PRODUCER_COMPRESSION
+  echo;echo "Hit Return"
+  setPar P_PRODUCER_COMPRESSION ${P_PRODUCER_COMPRESSION}
+  read Paused
+}
+
+setCdrFiles()
+{
+  clear;echo;echo "Set the number of file to gebnerate, each containing ${P_CDRS_PER_FILE} . It is currently ${P_CDR_FILES}."
+  echo "Enter the new CDR files:"
+  read P_CDR_FILES
+  echo;echo "Hit Return"
+  setPar P_CDR_FILES ${P_CDR_FILES}
+  read Paused
+}
+
+setTopicName()
+{
+  clear;echo;echo "Set the topic name to use. It is currently ${P_TOPIC_NAME}."
+  echo "Enter the new topic name:"
+  read P_TOPIC_NAME
+  echo;echo "Hit Return"
+  setPar P_TOPIC_NAME ${P_TOPIC_NAME}
+  read Paused
+}
+
+setIntervalSecs()
+{
+  clear;echo;echo "The number of events to load is ${P_BATCHSIZE} and the offset for the next batch is ${OF}. Interval seconds is ${P_INTERVAL_SECS}"
+  echo "Change the Interval seconds (${P_INTERVAL_SECS}):"
+  read P_INTERVAL_SECS
+  echo;echo "Hit Return"
+  setPar P_INTERVAL_SECS $P_INTERVAL_SECS
+  read Paused
+}
+
+setIterations()
+{
+  clear;echo;echo "The number of events to load is ${P_BATCHSIZE} and the offset for the next batch is ${OF}"
+  echo "The number of iterations to is ${P_LOOPS} (at 30 second intervals)"
+  echo "Change the number of iterations (1-1000):"
+  read P_LOOPS
+  echo;echo "Hit Return"
+  setPar P_LOOPS $P_LOOPS
+  read Paused
+}
+setCsvBatchSize()
+{
+  clear;echo;echo "The number of events to load is ${P_BATCHSIZE} and the offset for the next batch is ${OF}"
+  echo "Enter the number of events to load"
+  read P_BATCHSIZE
+  OF2=$((OF+P_BATCHSIZE))
+  OF=${OF2}
+  echo;echo "Hit Return"
+  read Paused
+}
+
+
+sqliteRemeber()
+{
+echo;echo printf "${Red} Remember .. ${RESET}\N"
+echo "Unparseable date: "2019-06-22" does not match (...)"
+echo "Bulk will repeatedly reload the same data. Set an infinite poll interval"
+echo
+}
+
+
+
+
+run_ccloud_generate_configs()
+{
+cat <<EOF
+###############################################################################
+# Overview:
+# This code reads the Confluent Cloud configuration in $HOME/.ccloud/config
+# and writes delta configuration files into ./delta_configs for
+# Confluent Platform components and clients connecting to Confluent Cloud.
+#
+# Add the delta configurations to the respective component configuration files
+# or application code. Reminder: these are _delta_ configurations, not complete
+# configurations. See https://docs.confluent.io/ for complete examples.
+#
+# Delta configurations include customized settings for:
+# - bootstrap servers -> Confluent Cloud brokers
+# - sasl.username -> key
+# - sasl.password -> secret
+# - interceptors for Streams Monitoring in Confluent Control Center
+# - optimized performance to Confluent Cloud (varies based on client defaults)
+#
+# Confluent Platform Components: 
+# - Confluent Schema Registry
+# - KSQL Data Generator
+# - KSQL server 
+# - Confluent Replicator (executable)
+# - Confluent Control Center
+# - Kafka Connect
+# - Kafka connector
+# - AK command line tools
+#
+# Kafka Clients:
+# - Java (Producer/Consumer)
+# - Java (Streams)
+# - Python
+# - .NET
+# - Go
+# - Node.js (https://github.com/Blizzard/node-rdkafka)
+# - C++
+#
+# OS:
+# - ENV file
+###############################################################################
+
+################################################################################
+# Arguments 
+# 1 (optional) - CONFIG_FILE, defaults to ~/.ccloud/config, (required if specifying SR_CONFIG_FILE)
+# 2 (optional) - SR_CONFIG_FILE, defaults to CONFIG_FILE
+################################################################################
+# Example file at ~/.ccloud/config
+#
+#   $ cat $HOME/.ccloud/config
+#   bootstrap.servers=<BROKER ENDPOINT>
+#   ssl.endpoint.identification.algorithm=https
+#   security.protocol=SASL_SSL
+#   sasl.mechanism=PLAIN
+#   sasl.jaas.config=org.apache.kafka.common.security.plain.PlainLoginModule required username\="<API KEY>" password\="<API SECRET>";
+################################################################################
+
+Hit <return> to generate the config files.
+EOF
+read Paused
+
+CONFIG_FILE=$1
+if [[ -z "$CONFIG_FILE" ]]; then
+  CONFIG_FILE=~/.ccloud/config
+fi
+if [[ ! -f "$CONFIG_FILE" ]]; then
+  echo "File at $CONFIG_FILE is not found.  Please create this properties file to connect to your Confluent Cloud cluster and then try again"
+  exit 1
+fi
+echo "CONFIG_FILE: $CONFIG_FILE"
+
+SR_CONFIG_FILE=$2
+if [[ -z "$SR_CONFIG_FILE" ]]; then
+  SR_CONFIG_FILE=$CONFIG_FILE
+fi
+if [[ ! -f "$SR_CONFIG_FILE" ]]; then
+  echo "File at $SR_CONFIG_FILE is not found.  Please create this properties file to connect to your Schema Registry and then try again"
+  exit 1
+fi
+echo "SR_CONFIG_FILE: $SR_CONFIG_FILE"
+
+# Set permissions
+PERM=600
+if ls --version 2>/dev/null | grep -q 'coreutils' ; then
+  # GNU binutils
+  PERM=$(stat -c "%a" $CONFIG_FILE)
+else
+  # BSD
+  PERM=$(stat -f "%OLp" $CONFIG_FILE)
+fi
+#echo "INFO: setting file permission to $PERM"
+
+# Make destination
+mkdir -p $DELTA_CONFIGS   2>/dev/null
+
+################################################################################
+# Glean parameters from the Confluent Cloud configuration file
+################################################################################
+BOOTSTRAP_SERVERS=$( grep "^bootstrap.server" $CONFIG_FILE | awk -F'=' '{print $2;}' )
+BOOTSTRAP_SERVERS=${BOOTSTRAP_SERVERS/\\/}
+export SASL_JAAS_CONFIG=$( grep "^sasl.jaas.config" $CONFIG_FILE | cut -d'=' -f2- )
+SASL_JAAS_CONFIG_PROPERTY_FORMAT=${SASL_JAAS_CONFIG/username\\=/username=}
+SASL_JAAS_CONFIG_PROPERTY_FORMAT=${SASL_JAAS_CONFIG_PROPERTY_FORMAT/password\\=/password=}
+CLOUD_KEY=$( echo $SASL_JAAS_CONFIG | awk '{print $3}' | awk -F'"' '$0=$2' )
+CLOUD_SECRET=$( echo $SASL_JAAS_CONFIG | awk '{print $4}' | awk -F'"' '$0=$2' )
+#echo "bootstrap.servers: $BOOTSTRAP_SERVERS"
+#echo "sasl.jaas.config: $SASL_JAAS_CONFIG"
+#echo "key: $CLOUD_KEY"
+#echo "secret: $CLOUD_SECRET"
+
+BASIC_AUTH_CREDENTIALS_SOURCE=$( grep "^basic.auth.credentials.source" $SR_CONFIG_FILE | awk -F'=' '{print $2;}' )
+export SCHEMA_REGISTRY_BASIC_AUTH_USER_INFO=$( grep "^schema.registry.basic.auth.user.info" $SR_CONFIG_FILE | awk -F'=' '{print $2;}' )
+export SCHEMA_REGISTRY_URL=$( grep "^schema.registry.url" $SR_CONFIG_FILE | awk -F'=' '{print $2;}' )
+#echo "basic.auth.credentials.source: $BASIC_AUTH_CREDENTIALS_SOURCE"
+#echo "schema.registry.basic.auth.user.info: $SCHEMA_REGISTRY_BASIC_AUTH_USER_INFO"
+#echo "schema.registry.url: $SCHEMA_REGISTRY_URL"
+
+
+################################################################################
+# Build configuration file with CCloud connection parameters and
+# Confluent Monitoring Interceptors for Streams Monitoring in Confluent Control Center
+################################################################################
+INTERCEPTORS_CONFIG_FILE=$DELTA_CONFIGS/interceptors-ccloud.config
+rm -f $INTERCEPTORS_CONFIG_FILE
+echo "# Configuration derived from $CONFIG_FILE" > $INTERCEPTORS_CONFIG_FILE
+while read -r line
+do
+  # Skip lines that are commented out
+  if [[ ! -z $line && ${line:0:1} == '#' ]]; then
+    continue
+  fi
+  # Skip lines that contain just whitespace
+  if [[ -z "${line// }" ]]; then
+    continue
+  fi
+  if [[ ${line:0:9} == 'bootstrap' ]]; then
+    line=${line/\\/}
+  fi
+  echo $line >> $INTERCEPTORS_CONFIG_FILE
+done < "$CONFIG_FILE"
+echo -e "\n# Confluent Monitoring Interceptor specific configuration" >> $INTERCEPTORS_CONFIG_FILE
+while read -r line
+do
+  # Skip lines that are commented out
+  if [[ ! -z $line && ${line:0:1} == '#' ]]; then
+    continue
+  fi
+  # Skip lines that contain just whitespace
+  if [[ -z "${line// }" ]]; then
+    continue
+  fi
+  if [[ ${line:0:9} == 'bootstrap' ]]; then
+    line=${line/\\/}
+  fi
+  if [[ ${line:0:4} == 'sasl' ||
+        ${line:0:3} == 'ssl' ||
+        ${line:0:8} == 'security' ||
+        ${line:0:9} == 'bootstrap' ]]; then
+    echo "confluent.monitoring.interceptor.$line" >> $INTERCEPTORS_CONFIG_FILE
+  fi
+done < "$CONFIG_FILE"
+chmod $PERM $INTERCEPTORS_CONFIG_FILE
+
+echo -e "\nConfluent Platform Components:"
+
+################################################################################
+# Confluent Schema Registry instance (local) for Confluent Cloud
+################################################################################
+SR_CONFIG_DELTA=$DELTA_CONFIGS/schema-registry-ccloud.delta
+echo "$SR_CONFIG_DELTA"
+rm -f $SR_CONFIG_DELTA
+while read -r line
+do
+  if [[ ! -z $line && ${line:0:1} != '#' ]]; then
+    if [[ ${line:0:29} != 'basic.auth.credentials.source' && ${line:0:15} != 'schema.registry' ]]; then
+      echo "kafkastore.$line" >> $SR_CONFIG_DELTA
+    fi
+  fi
+done < "$CONFIG_FILE"
+chmod $PERM $SR_CONFIG_DELTA
+
+################################################################################
+# Confluent Replicator (executable) for Confluent Cloud
+################################################################################
+REPLICATOR_PRODUCER_DELTA=$DELTA_CONFIGS/replicator-to-ccloud-producer.delta
+echo "$REPLICATOR_PRODUCER_DELTA"
+rm -f $REPLICATOR_PRODUCER_DELTA
+cp $INTERCEPTORS_CONFIG_FILE $REPLICATOR_PRODUCER_DELTA
+echo -e "\n# Confluent Replicator (executable) specific configuration" >> $REPLICATOR_PRODUCER_DELTA
+echo "interceptor.classes=io.confluent.monitoring.clients.interceptor.MonitoringProducerInterceptor" >> $REPLICATOR_PRODUCER_DELTA
+echo "request.timeout.ms=200000" >> $REPLICATOR_PRODUCER_DELTA
+echo "retry.backoff.ms=500" >> $REPLICATOR_PRODUCER_DELTA
+REPLICATOR_SASL_JAAS_CONFIG=$SASL_JAAS_CONFIG
+REPLICATOR_SASL_JAAS_CONFIG=${REPLICATOR_SASL_JAAS_CONFIG//\\=/=}
+REPLICATOR_SASL_JAAS_CONFIG=${REPLICATOR_SASL_JAAS_CONFIG//\"/\\\"}
+chmod $PERM $REPLICATOR_PRODUCER_DELTA
+
+################################################################################
+# KSQL Server runs locally and connects to Confluent Cloud
+################################################################################
+KSQL_SERVER_DELTA=$DELTA_CONFIGS/ksql-server-ccloud.delta
+echo "$KSQL_SERVER_DELTA"
+cp $INTERCEPTORS_CONFIG_FILE $KSQL_SERVER_DELTA
+echo -e "\n# KSQL Server specific configuration" >> $KSQL_SERVER_DELTA
+echo "producer.interceptor.classes=io.confluent.monitoring.clients.interceptor.MonitoringProducerInterceptor" >> $KSQL_SERVER_DELTA
+echo "consumer.interceptor.classes=io.confluent.monitoring.clients.interceptor.MonitoringConsumerInterceptor" >> $KSQL_SERVER_DELTA
+echo "ksql.streams.producer.retries=2147483647" >> $KSQL_SERVER_DELTA
+echo "ksql.streams.producer.confluent.batch.expiry.ms=9223372036854775807" >> $KSQL_SERVER_DELTA
+echo "ksql.streams.producer.request.timeout.ms=300000" >> $KSQL_SERVER_DELTA
+echo "ksql.streams.producer.max.block.ms=9223372036854775807" >> $KSQL_SERVER_DELTA
+echo "ksql.streams.replication.factor=3" >> $KSQL_SERVER_DELTA
+echo "ksql.internal.topic.replicas=3" >> $KSQL_SERVER_DELTA
+echo "ksql.sink.replicas=3" >> $KSQL_SERVER_DELTA
+echo -e "\n# Confluent Schema Registry configuration for KSQL Server" >> $KSQL_SERVER_DELTA
+while read -r line
+do
+  if [[ ${line:0:29} == 'basic.auth.credentials.source' ]]; then
+    echo "ksql.schema.registry.$line" >> $KSQL_SERVER_DELTA
+  elif [[ ${line:0:15} == 'schema.registry' ]]; then
+    echo "ksql.$line" >> $KSQL_SERVER_DELTA
+  fi
+done < $SR_CONFIG_FILE
+chmod $PERM $KSQL_SERVER_DELTA
+
+################################################################################
+# KSQL DataGen for Confluent Cloud
+################################################################################
+KSQL_DATAGEN_DELTA=$DELTA_CONFIGS/ksql-datagen.delta
+echo "$KSQL_DATAGEN_DELTA"
+rm -f $KSQL_DATAGEN_DELTA
+cp $INTERCEPTORS_CONFIG_FILE $KSQL_DATAGEN_DELTA
+echo -e "\n# KSQL DataGen specific configuration" >> $KSQL_DATAGEN_DELTA
+echo "interceptor.classes=io.confluent.monitoring.clients.interceptor.MonitoringProducerInterceptor" >> $KSQL_DATAGEN_DELTA
+echo -e "\n# Confluent Schema Registry configuration for KSQL DataGen" >> $KSQL_DATAGEN_DELTA
+while read -r line
+do
+  if [[ ${line:0:29} == 'basic.auth.credentials.source' ]]; then
+    echo "ksql.schema.registry.$line" >> $KSQL_DATAGEN_DELTA
+  elif [[ ${line:0:15} == 'schema.registry' ]]; then
+    echo "ksql.$line" >> $KSQL_DATAGEN_DELTA
+  fi
+done < $SR_CONFIG_FILE
+chmod $PERM $KSQL_DATAGEN_DELTA
+
+################################################################################
+# Confluent Control Center runs locally, monitors Confluent Cloud, and uses Confluent Cloud cluster as the backstore
+################################################################################
+C3_DELTA=$DELTA_CONFIGS/control-center-ccloud.delta
+echo "$C3_DELTA"
+rm -f $C3_DELTA
+echo -e "\n# Confluent Control Center specific configuration" >> $C3_DELTA
+while read -r line
+  do
+  if [[ ! -z $line && ${line:0:1} != '#' ]]; then
+    if [[ ${line:0:9} == 'bootstrap' ]]; then
+      line=${line/\\/}
+      echo "$line" >> $C3_DELTA
+    fi
+    if [[ ${line:0:4} == 'sasl' || ${line:0:3} == 'ssl' || ${line:0:8} == 'security' ]]; then
+      echo "confluent.controlcenter.streams.$line" >> $C3_DELTA
+    fi
+  fi
+done < "$CONFIG_FILE"
+echo -e "\n# Confluent Schema Registry configuration for Confluent Control Center" >> $C3_DELTA
+while read -r line
+do
+  if [[ ${line:0:29} == 'basic.auth.credentials.source' ]]; then
+    echo "confluent.controlcenter.schema.registry.$line" >> $C3_DELTA
+  elif [[ ${line:0:15} == 'schema.registry' ]]; then
+    echo "confluent.controlcenter.$line" >> $C3_DELTA
+  fi
+done < $SR_CONFIG_FILE
+chmod $PERM $C3_DELTA
+
+################################################################################
+# Kafka Connect runs locally and connects to Confluent Cloud
+################################################################################
+CONNECT_DELTA=$DELTA_CONFIGS/connect-ccloud.delta
+echo "$CONNECT_DELTA"
+rm -f $CONNECT_DELTA
+cat <<EOF > $CONNECT_DELTA
+replication.factor=3
+config.storage.replication.factor=3
+offset.storage.replication.factor=3
+status.storage.replication.factor=3
+EOF
+while read -r line
+  do
+  if [[ ! -z $line && ${line:0:1} != '#' ]]; then
+    if [[ ${line:0:9} == 'bootstrap' ]]; then
+      line=${line/\\/}
+      echo "$line" >> $CONNECT_DELTA
+    fi
+    if [[ ${line:0:4} == 'sasl' || ${line:0:3} == 'ssl' || ${line:0:8} == 'security' ]]; then
+      echo "$line" >> $CONNECT_DELTA
+    fi
+  fi
+done < "$CONFIG_FILE"
+echo -e "\n# Connect producer and consumer specific configuration" >> $CONNECT_DELTA
+while read -r line
+  do
+  if [[ ! -z $line && ${line:0:1} != '#' ]]; then
+    if [[ ${line:0:9} == 'bootstrap' ]]; then
+      line=${line/\\/}
+    fi
+    if [[ ${line:0:4} == 'sasl' || ${line:0:3} == 'ssl' || ${line:0:8} == 'security' ]]; then
+      echo "producer.$line" >> $CONNECT_DELTA
+      echo "producer.confluent.monitoring.interceptor.$line" >> $CONNECT_DELTA
+      echo "consumer.$line" >> $CONNECT_DELTA
+      echo "consumer.confluent.monitoring.interceptor.$line" >> $CONNECT_DELTA
+    fi
+  fi
+done < "$CONFIG_FILE"
+cat <<EOF >> $CONNECT_DELTA
+# Confluent Schema Registry for Kafka Connect
+value.converter=io.confluent.connect.avro.AvroConverter
+value.converter.basic.auth.credentials.source=$BASIC_AUTH_CREDENTIALS_SOURCE
+value.converter.schema.registry.basic.auth.user.info=$SCHEMA_REGISTRY_BASIC_AUTH_USER_INFO
+value.converter.schema.registry.url=$SCHEMA_REGISTRY_URL
+EOF
+chmod $PERM $CONNECT_DELTA
+
+################################################################################
+# Kafka connector
+################################################################################
+CONNECTOR_DELTA=$DELTA_CONFIGS/connector-ccloud.delta
+echo "$CONNECTOR_DELTA"
+rm -f $CONNECTOR_DELTA
+cat <<EOF >> $CONNECTOR_DELTA
+// Confluent Schema Registry for Kafka connectors
+value.converter=io.confluent.connect.avro.AvroConverter
+value.converter.basic.auth.credentials.source=$BASIC_AUTH_CREDENTIALS_SOURCE
+value.converter.schema.registry.basic.auth.user.info=$SCHEMA_REGISTRY_BASIC_AUTH_USER_INFO
+value.converter.schema.registry.url=$SCHEMA_REGISTRY_URL
+EOF
+chmod $PERM $CONNECTOR_DELTA
+
+################################################################################
+# AK command line tools
+################################################################################
+AK_TOOLS_DELTA=$DELTA_CONFIGS/ak-tools-ccloud.delta
+echo "$AK_TOOLS_DELTA"
+rm -f $AK_TOOLS_DELTA
+cp $CONFIG_FILE $AK_TOOLS_DELTA
+chmod $PERM $AK_TOOLS_DELTA
+
+
+echo -e "\nKafka Clients:"
+
+################################################################################
+# Java (Producer/Consumer)
+################################################################################
+JAVA_PC_CONFIG=$DELTA_CONFIGS/java_producer_consumer.delta
+echo "$JAVA_PC_CONFIG"
+rm -f $JAVA_PC_CONFIG
+
+cat <<EOF >> $JAVA_PC_CONFIG
+import java.util.Properties;
+import org.apache.kafka.clients.producer.ProducerConfig;
+import org.apache.kafka.clients.producer.ConsumerConfig;
+import org.apache.kafka.common.config.SaslConfigs;
+Properties props = new Properties();
+// Basic Confluent Cloud Connectivity
+props.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, "$BOOTSTRAP_SERVERS");
+props.put(ProducerConfig.REPLICATION_FACTOR_CONFIG, 3);
+props.put(ProducerConfig.SECURITY_PROTOCOL_CONFIG, "SASL_SSL");
+props.put(SaslConfigs.SASL_MECHANISM, "PLAIN");
+props.put(SaslConfigs.SASL_JAAS_CONFIG, "$SASL_JAAS_CONFIG");
+// Confluent Schema Registry for Java
+props.put("basic.auth.credentials.source", "$BASIC_AUTH_CREDENTIALS_SOURCE");
+props.put("schema.registry.basic.auth.user.info", "$SCHEMA_REGISTRY_BASIC_AUTH_USER_INFO");
+props.put("schema.registry.url", "$SCHEMA_REGISTRY_URL");
+// Optimize Performance for Confluent Cloud
+props.put(ProducerConfig.RETRIES_CONFIG, 2147483647);
+props.put("producer.confluent.batch.expiry.ms", 9223372036854775807);
+props.put(ProducerConfig.REQUEST_TIMEOUT_MS_CONFIG, 300000);
+props.put(ProducerConfig.MAX_BLOCK_MS_CONFIG, 9223372036854775807);
+// Required for Streams Monitoring in Confluent Control Center
+props.put(ProducerConfig.INTERCEPTOR_CLASSES_CONFIG, "io.confluent.monitoring.clients.interceptor.MonitoringProducerInterceptor");
+props.put(ProducerConfig.INTERCEPTOR_CLASSES_CONFIG + ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, confluent.monitoring.interceptor.bootstrap.servers, "$BOOTSTRAP_SERVERS");
+props.put(ProducerConfig.INTERCEPTOR_CLASSES_CONFIG + ProducerConfig.SECURITY_PROTOCOL_CONFIG, "SASL_SSL");
+props.put(ProducerConfig.INTERCEPTOR_CLASSES_CONFIG + SaslConfigs.SASL_MECHANISM, "PLAIN");
+props.put(ProducerConfig.INTERCEPTOR_CLASSES_CONFIG + SaslConfigs.SASL_JAAS_CONFIG, "$SASL_JAAS_CONFIG");
+props.put(ConsumerConfig.INTERCEPTOR_CLASSES_CONFIG, "io.confluent.monitoring.clients.interceptor.MonitoringConsumerInterceptor");
+props.put(ConsumerConfig.INTERCEPTOR_CLASSES_CONFIG + ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, confluent.monitoring.interceptor.bootstrap.servers, "$BOOTSTRAP_SERVERS");
+props.put(ConsumerConfig.INTERCEPTOR_CLASSES_CONFIG + ProducerConfig.SECURITY_PROTOCOL_CONFIG, "SASL_SSL");
+props.put(ConsumerConfig.INTERCEPTOR_CLASSES_CONFIG + SaslConfigs.SASL_MECHANISM, "PLAIN");
+props.put(ConsumerConfig.INTERCEPTOR_CLASSES_CONFIG + SaslConfigs.SASL_JAAS_CONFIG, "$SASL_JAAS_CONFIG");
+// .... additional configuration settings
+EOF
+chmod $PERM $JAVA_PC_CONFIG
+
+################################################################################
+# Java (Streams)
+################################################################################
+JAVA_STREAMS_CONFIG=$DELTA_CONFIGS/java_streams.delta
+echo "$JAVA_STREAMS_CONFIG"
+rm -f $JAVA_STREAMS_CONFIG
+
+cat <<EOF >> $JAVA_STREAMS_CONFIG
+import java.util.Properties;
+import org.apache.kafka.clients.producer.ProducerConfig;
+import org.apache.kafka.clients.producer.ConsumerConfig;
+import org.apache.kafka.common.config.SaslConfigs;
+import org.apache.kafka.streams.StreamsConfig;
+Properties props = new Properties();
+// Basic Confluent Cloud Connectivity
+props.put(StreamsConfig.BOOTSTRAP_SERVERS_CONFIG, "$BOOTSTRAP_SERVERS");
+props.put(StreamsConfig.REPLICATION_FACTOR_CONFIG, 3);
+props.put(StreamsConfig.SECURITY_PROTOCOL_CONFIG, "SASL_SSL");
+props.put(SaslConfigs.SASL_MECHANISM, "PLAIN");
+props.put(SaslConfigs.SASL_JAAS_CONFIG, "$SASL_JAAS_CONFIG");
+// Confluent Schema Registry for Java
+props.put("basic.auth.credentials.source", "$BASIC_AUTH_CREDENTIALS_SOURCE");
+props.put("schema.registry.basic.auth.user.info", "$SCHEMA_REGISTRY_BASIC_AUTH_USER_INFO");
+props.put("schema.registry.url", "$SCHEMA_REGISTRY_URL");
+// Optimize Performance for Confluent Cloud
+props.put(StreamsConfig.producerPrefix(ProducerConfig.RETRIES_CONFIG), 2147483647);
+props.put("producer.confluent.batch.expiry.ms", 9223372036854775807);
+props.put(StreamsConfig.producerPrefix(ProducerConfig.REQUEST_TIMEOUT_MS_CONFIG), 300000);
+props.put(StreamsConfig.producerPrefix(ProducerConfig.MAX_BLOCK_MS_CONFIG), 9223372036854775807);
+// Required for Streams Monitoring in Confluent Control Center
+props.put(StreamsConfig.PRODUCER_PREFIX + ProducerConfig.INTERCEPTOR_CLASSES_CONFIG, "io.confluent.monitoring.clients.interceptor.MonitoringProducerInterceptor");
+props.put(StreamsConfig.PRODUCER_PREFIX + ProducerConfig.INTERCEPTOR_CLASSES_CONFIG + StreamsConfig.BOOTSTRAP_SERVERS_CONFIG, confluent.monitoring.interceptor.bootstrap.servers, "$BOOTSTRAP_SERVERS");
+props.put(StreamsConfig.PRODUCER_PREFIX + ProducerConfig.INTERCEPTOR_CLASSES_CONFIG + StreamsConfig.SECURITY_PROTOCOL_CONFIG, "SASL_SSL");
+props.put(StreamsConfig.PRODUCER_PREFIX + ProducerConfig.INTERCEPTOR_CLASSES_CONFIG + SaslConfigs.SASL_MECHANISM, "PLAIN");
+props.put(StreamsConfig.PRODUCER_PREFIX + ProducerConfig.INTERCEPTOR_CLASSES_CONFIG + SaslConfigs.SASL_JAAS_CONFIG, "$SASL_JAAS_CONFIG");
+props.put(StreamsConfig.CONSUMER_PREFIX + ConsumerConfig.INTERCEPTOR_CLASSES_CONFIG, "io.confluent.monitoring.clients.interceptor.MonitoringConsumerInterceptor");
+props.put(StreamsConfig.CONSUMER_PREFIX + ConsumerConfig.INTERCEPTOR_CLASSES_CONFIG + StreamsConfig.BOOTSTRAP_SERVERS_CONFIG, confluent.monitoring.interceptor.bootstrap.servers, "$BOOTSTRAP_SERVERS");
+props.put(StreamsConfig.CONSUMER_PREFIX + ConsumerConfig.INTERCEPTOR_CLASSES_CONFIG + StreamsConfig.SECURITY_PROTOCOL_CONFIG, "SASL_SSL");
+props.put(StreamsConfig.CONSUMER_PREFIX + ConsumerConfig.INTERCEPTOR_CLASSES_CONFIG + SaslConfigs.SASL_MECHANISM, "PLAIN");
+props.put(StreamsConfig.CONSUMER_PREFIX + ConsumerConfig.INTERCEPTOR_CLASSES_CONFIG + SaslConfigs.SASL_JAAS_CONFIG, "$SASL_JAAS_CONFIG");
+// .... additional configuration settings
+EOF
+chmod $PERM $JAVA_STREAMS_CONFIG
+
+################################################################################
+# Python
+################################################################################
+PYTHON_CONFIG=$DELTA_CONFIGS/python.delta
+echo "$PYTHON_CONFIG"
+rm -f $PYTHON_CONFIG
+
+cat <<EOF >> $PYTHON_CONFIG
+from confluent_kafka import Producer, Consumer, KafkaError
+producer = Producer({
+           'bootstrap.servers': '$BOOTSTRAP_SERVERS',
+           'broker.version.fallback': '0.10.0.0',
+           'api.version.fallback.ms': 0,
+           'sasl.mechanisms': 'PLAIN',
+           'security.protocol': 'SASL_SSL',
+           'sasl.username': '$CLOUD_KEY',
+           'sasl.password': '$CLOUD_SECRET',
+           // 'ssl.ca.location': '/usr/local/etc/openssl/cert.pem', // varies by distro
+           'plugin.library.paths': 'monitoring-interceptor',
+           // .... additional configuration settings
+})
+consumer = Consumer({
+           'bootstrap.servers': '$BOOTSTRAP_SERVERS',
+           'broker.version.fallback': '0.10.0.0',
+           'api.version.fallback.ms': 0,
+           'sasl.mechanisms': 'PLAIN',
+           'security.protocol': 'SASL_SSL',
+           'sasl.username': '$CLOUD_KEY',
+           'sasl.password': '$CLOUD_SECRET',
+           // 'ssl.ca.location': '/usr/local/etc/openssl/cert.pem', // varies by distro
+           'plugin.library.paths': 'monitoring-interceptor',
+           // .... additional configuration settings
+})
+EOF
+chmod $PERM $PYTHON_CONFIG
+
+################################################################################
+# .NET 
+################################################################################
+DOTNET_CONFIG=$DELTA_CONFIGS/dotnet.delta
+echo "$DOTNET_CONFIG"
+rm -f $DOTNET_CONFIG
+
+cat <<EOF >> $DOTNET_CONFIG
+using Confluent.Kafka;
+var producerConfig = new Dictionary<string, object>
+{
+    { "bootstrap.servers", "$BOOTSTRAP_SERVERS" },
+    { "broker.version.fallback", "0.10.0.0" },
+    { "api.version.fallback.ms", 0 },
+    { "sasl.mechanisms", "PLAIN" },
+    { "security.protocol", "SASL_SSL" },
+    { "sasl.username", "$CLOUD_KEY" },
+    { "sasl.password", "$CLOUD_SECRET" },
+    // { "ssl.ca.location", "/usr/local/etc/openssl/cert.pem" }, // varies by distro
+    { “plugin.library.paths”, “monitoring-interceptor”},
+    // .... additional configuration settings
+};
+var consumerConfig = new Dictionary<string, object>
+{
+    { "bootstrap.servers", "$BOOTSTRAP_SERVERS" },
+    { "broker.version.fallback", "0.10.0.0" },
+    { "api.version.fallback.ms", 0 },
+    { "sasl.mechanisms", "PLAIN" },
+    { "security.protocol", "SASL_SSL" },
+    { "sasl.username", "$CLOUD_KEY" },
+    { "sasl.password", "$CLOUD_SECRET" },
+    // { "ssl.ca.location", "/usr/local/etc/openssl/cert.pem" }, // varies by distro
+    { “plugin.library.paths”, “monitoring-interceptor”},
+    // .... additional configuration settings
+};
+EOF
+chmod $PERM $DOTNET_CONFIG
+
+################################################################################
+# Go
+################################################################################
+GO_CONFIG=$DELTA_CONFIGS/go.delta
+echo "$GO_CONFIG"
+rm -f $GO_CONFIG
+
+cat <<EOF >> $GO_CONFIG
+import (
+	"github.com/confluentinc/confluent-kafka-go/kafka"
+)
+producer, err := kafka.NewProducer(&kafka.ConfigMap{
+	         "bootstrap.servers": "$BOOTSTRAP_SERVERS",
+	         "broker.version.fallback": "0.10.0.0",
+	         "api.version.fallback.ms": 0,
+	         "sasl.mechanisms": "PLAIN",
+	         "security.protocol": "SASL_SSL",
+	         "sasl.username": "$CLOUD_KEY",
+	         "sasl.password": "$CLOUD_SECRET",
+                 // "ssl.ca.location": "/usr/local/etc/openssl/cert.pem", // varies by distro
+                 "plugin.library.paths": "monitoring-interceptor",
+                 // .... additional configuration settings
+                 })
+consumer, err := kafka.NewConsumer(&kafka.ConfigMap{
+		 "bootstrap.servers": "$BOOTSTRAP_SERVERS",
+		 "broker.version.fallback": "0.10.0.0",
+		 "api.version.fallback.ms": 0,
+		 "sasl.mechanisms": "PLAIN",
+		 "security.protocol": "SASL_SSL",
+		 "sasl.username": "$CLOUD_KEY",
+		 "sasl.password": "$CLOUD_SECRET",
+                 // "ssl.ca.location": "/usr/local/etc/openssl/cert.pem", // varies by distro
+		 "session.timeout.ms": 6000,
+                 "plugin.library.paths": "monitoring-interceptor",
+                 // .... additional configuration settings
+                 })
+EOF
+chmod $PERM $GO_CONFIG
+
+################################################################################
+# Node.js
+################################################################################
+NODE_CONFIG=$DELTA_CONFIGS/node.delta
+echo "$NODE_CONFIG"
+rm -f $NODE_CONFIG
+
+cat <<EOF >> $NODE_CONFIG
+var Kafka = require('node-rdkafka');
+var producer = new Kafka.Producer({
+    'metadata.broker.list': '$BOOTSTRAP_SERVERS',
+    'sasl.mechanisms': 'PLAIN',
+    'security.protocol': 'SASL_SSL',
+    'sasl.username': '$CLOUD_KEY',
+    'sasl.password': '$CLOUD_SECRET',
+     // 'ssl.ca.location': '/usr/local/etc/openssl/cert.pem', // varies by distro
+    'plugin.library.paths': 'monitoring-interceptor',
+    // .... additional configuration settings
+  });
+var consumer = Kafka.KafkaConsumer.createReadStream({
+    'metadata.broker.list': '$BOOTSTRAP_SERVERS',
+    'sasl.mechanisms': 'PLAIN',
+    'security.protocol': 'SASL_SSL',
+    'sasl.username': '$CLOUD_KEY',
+    'sasl.password': '$CLOUD_SECRET',
+     // 'ssl.ca.location': '/usr/local/etc/openssl/cert.pem', // varies by distro
+    'plugin.library.paths': 'monitoring-interceptor',
+    // .... additional configuration settings
+  }, {}, {
+    topics: '<topic name>',
+    waitInterval: 0,
+    objectMode: false
+});
+EOF
+chmod $PERM $NODE_CONFIG
+
+################################################################################
+# C++
+################################################################################
+CPP_CONFIG=$DELTA_CONFIGS/cpp.delta
+echo "$CPP_CONFIG"
+rm -f $CPP_CONFIG
+
+cat <<EOF >> $CPP_CONFIG
+#include <librdkafka/rdkafkacpp.h>
+RdKafka::Conf *producerConfig = RdKafka::Conf::create(RdKafka::Conf::CONF_GLOBAL);
+if (producerConfig->set("metadata.broker.list", "$BOOTSTRAP_SERVERS", errstr) != RdKafka::Conf::CONF_OK ||
+    producerConfig->set("sasl.mechanisms", "PLAIN", errstr) != RdKafka::Conf::CONF_OK ||
+    producerConfig->set("security.protocol", "SASL_SSL", errstr) != RdKafka::Conf::CONF_OK ||
+    producerConfig->set("sasl.username", "$CLOUD_KEY", errstr) != RdKafka::Conf::CONF_OK ||
+    producerConfig->set("sasl.password", "$CLOUD_SECRET", errstr) != RdKafka::Conf::CONF_OK ||
+    // producerConfig->set("ssl.ca.location", "/usr/local/etc/openssl/cert.pem", errstr) != RdKafka::Conf::CONF_OK || // varies by distro
+    producerConfig->set("plugin.library.paths", "monitoring-interceptor", errstr) != RdKafka::Conf::CONF_OK ||
+    // .... additional configuration settings
+   ) {
+        std::cerr << "Configuration failed: " << errstr << std::endl;
+        exit(1);
+}
+RdKafka::Producer *producer = RdKafka::Producer::create(producerConfig, errstr);
+RdKafka::Conf *consumerConfig = RdKafka::Conf::create(RdKafka::Conf::CONF_GLOBAL);
+if (consumerConfig->set("metadata.broker.list", "$BOOTSTRAP_SERVERS", errstr) != RdKafka::Conf::CONF_OK ||
+    consumerConfig->set("sasl.mechanisms", "PLAIN", errstr) != RdKafka::Conf::CONF_OK ||
+    consumerConfig->set("security.protocol", "SASL_SSL", errstr) != RdKafka::Conf::CONF_OK ||
+    consumerConfig->set("sasl.username", "$CLOUD_KEY", errstr) != RdKafka::Conf::CONF_OK ||
+    consumerConfig->set("sasl.password", "$CLOUD_SECRET", errstr) != RdKafka::Conf::CONF_OK ||
+    // consumerConfig->set("ssl.ca.location", "/usr/local/etc/openssl/cert.pem", errstr) != RdKafka::Conf::CONF_OK || // varies by distro
+    consumerConfig->set("plugin.library.paths", "monitoring-interceptor", errstr) != RdKafka::Conf::CONF_OK ||
+    // .... additional configuration settings
+   ) {
+        std::cerr << "Configuration failed: " << errstr << std::endl;
+        exit(1);
+}
+RdKafka::Consumer *consumer = RdKafka::Consumer::create(consumerConfig, errstr);
+EOF
+chmod $PERM $CPP_CONFIG
+
+################################################################################
+# ENV
+################################################################################
+ENV_CONFIG=$DELTA_CONFIGS/env.delta
+echo "$ENV_CONFIG"
+rm -f $ENV_CONFIG
+
+cat <<EOF >> $ENV_CONFIG
+export BOOTSTRAP_SERVERS='$BOOTSTRAP_SERVERS'
+export SASL_JAAS_CONFIG='$SASL_JAAS_CONFIG'
+export SASL_JAAS_CONFIG_PROPERTY_FORMAT='$SASL_JAAS_CONFIG_PROPERTY_FORMAT'
+export REPLICATOR_SASL_JAAS_CONFIG='$REPLICATOR_SASL_JAAS_CONFIG'
+export BASIC_AUTH_CREDENTIALS_SOURCE=$BASIC_AUTH_CREDENTIALS_SOURCE
+export SCHEMA_REGISTRY_BASIC_AUTH_USER_INFO=$SCHEMA_REGISTRY_BASIC_AUTH_USER_INFO
+export SCHEMA_REGISTRY_URL=$SCHEMA_REGISTRY_URL
+EOF
+chmod $PERM $ENV_CONFIG
+
+setPar P_CC_BOOTSTRAP_SERVERS ${BOOTSTRAP_SERVERS}
+}
+
+
+
+
+autoLoad()
+{
+SECS=$1
+for i in $(seq 1 $P_LOOPS)
+do
+  echo "(I) Processing $i of ${P_LOOPS} at ${SECS} sec intervals"
+  enqueueEvents
+  if [ ${i} -gt 1 ]
+  then
+    sleep ${SECS}
+  fi
+done
+}
+
+enqueueEvents()
+{
+  LPAD=`printf "%09d\n" $1`
+  ALL=$((OF+P_BATCHSIZE))
+  F=${QUEUEDIR}/${DT}_${OF}_${P_BATCHSIZE}.csv
+  head -${ALL} ${DATA_DIR}/2019_10m.csv > ${F}.x
+  tail -${P_BATCHSIZE} ${F}.x > ${F}
+  rm ${F}.x
+  printf "${Gre}Queued ${F} with ${P_BATCHSIZE} events from offset ${OF}${RESET}\n"
+  echo "(I) Queued files:"
+  ls -l ${QUEUEDIR}|grep csv
+  OF2=$((OF+P_BATCHSIZE))
+  OF=${OF2}
+  sleep 1
+}
+
+
+
+showPostgresTables()
+{
+  clear;echo;echo "(I) tables in Postgres .. "
+  sleep 1
+  export PGPASSWORD=gdelt_pw
+  echo "\dt" > /tmp/rowcountGdeltEvent.sql
+  echo 'SELECT count(*) from "KAFKA_GDELT_EVENT" LIMIT 2;' >> /tmp/rowcountGdeltEvent.sql
+  psql --dbname db_gdelt --echo-all --username gdelt --host 127.0.0.1  <<EOF
+  \i /tmp/rowcountGdeltEvent.sql
+EOF
+  echo;echo "Hit Return"
+  read Paused
+}
+
+
+
+destroyPostgres()
+{
+  clear;echo;echo "(I) Destroying Postgres setup MacOS..."
+  echo "(I) ignore 'psql: FATAL:  role "gdelt" does not exist'"
+  sleep 1
+  cat <<EOF >/tmp/destroyPostgres.sql
+ drop database db_gdelt;
+ drop user gdelt;
+EOF
+
+export PGPASSWORD=gdelt_pw
+psql --dbname postgres --echo-all --host 127.0.0.1 <<EOF
+\i /tmp/destroyPostgres.sql
+EOF
+echo;echo "Hit Return"
+read Paused
+clear
+}
+
+initPlugin()
+{
+  F=${1}
+  confluent-hub install ${F}
+  echo "Hit <return>"
+  read Paused
+}
+
+
+
+listConnectJobs()
+{
+  # list all running Kafka Connect jobs
+  C_PORT=$(getConnectPort $CS)
+  if [ "$(getConnectPID ${CS})" = "" ]
+  then
+    printf "${Red}Kafka-Connect (connect distributed) server number ${CS} single-node on port ${C_PORT} is not running.${RESET}"
+    Pause
+  else
+    export Connect="http://${Connect_Server}:${C_PORT}"
+    SEARCH=$1
+    F=/tmp/connect.jobs.txt
+    CONNECTORS=$(curl -X GET "${Connect}/connectors/" | jq . )
+    CONNECTORS_A=`echo $CONNECTORS   | sed "s/\[//"`
+    CONNECTORS_B=`echo $CONNECTORS_A | sed "s/\[//"`
+    CONNECTORS_C=`echo $CONNECTORS_B | sed "s/\]//"`
+    CONNECTORS_D=`echo $CONNECTORS_C | tr , ' '`
+    CONNECTORS_E=`echo $CONNECTORS_D | sed 's/\"//g'`
+    STR2=""
+    COUNTER=1
+    for i in `echo ${CONNECTORS_E}`
+    do
+      STR1="C${COUNTER}: ${i}  "
+      STR2="${STR2}${STR1}"
+      ((COUNTER++))
+    done
+    echo
+    if [ "${STR2}" = "" ]
+    then
+       printf "${Gre}There are no Kafka Connect jobs running. ${RESET}"
+    else
+       printf "${Gre}Kafka Connect jobs running: ${STR2} ${RESET}"
+    fi
+
+    Pause
+  fi
+}
+
+checkConnectJob()
+{
+  # search for a connect job name. If it is found, return the same parameter. Otherwise return nothing.
+  C_PORT=$(getConnectPort $CS)
+  export Connect="http://${Connect_Server}:${C_PORT}"
+  SEARCH=$1
+  F=/tmp/connect.jobs.txt
+  CONNECTORS=$(curl -X GET "${Connect}/connectors/" | jq . )
+  CONNECTORS_A=`echo $CONNECTORS   | sed "s/\[//"`
+  CONNECTORS_B=`echo $CONNECTORS_A | sed "s/\[//"`
+  CONNECTORS_C=`echo $CONNECTORS_B | sed "s/\]//"`
+  CONNECTORS_D=`echo $CONNECTORS_C | tr , ' '`
+  CONNECTORS_E=`echo $CONNECTORS_D | sed 's/\"//g'`
+  COUNTER=0
+  for i in `echo ${CONNECTORS_E}`
+  do
+    if [ "${i}" = "${SEARCH}" ]
+    then
+      echo ${i}
+    fi
+  done
+}
+
+
+
+
+describeEverything()
+{
+  # describe extended all topics to get the message counts
+  kafka-topics --zookeeper ${Bootstrap_Servers}:2181 --list > ${WORKDIR}/kafka-topics.txt
+  cat ${WORKDIR}/kafka-topics.txt | grep -v "connect-"|grep -v "_confluent"|grep -v "_consumer"|grep -v "_schemas"|grep -v "default_ksql_processing_log" >${WORKDIR}/kafka-topics.txt.1
+  cat ${WORKDIR}/kafka-topics.txt.1 | tr '\n' ' ' > ${WORKDIR}/kafka-topics.txt.2
+  TOPICS=`cat ${WORKDIR}/kafka-topics.txt.2`
+  echo "(I) topics = ${TOPICS}"
+  for i in `echo ${TOPICS}`
+  do
+    EVENTCOUNT=`kafka-run-class kafka.tools.GetOffsetShell --broker-list ${Bootstrap_Servers}:9092 --topic ${i} --time -1 --offsets 1 | awk -F ":" '{sum += $3} END {print sum}'`
+    printf "${Gre}Event Count for ${i} is ${EVENTCOUNT}${RESET}"
+  done
+  Pause
+}
+
+
+printConnectStatus()
+{
+   printf "__________________________________________________"
+   printf "\nConnect Servers: 01(8093)=" 
+   case `ps -ef|grep org.apache.kafka.connect.cli.ConnectDistributed|grep -v grep|grep 8093|wc -l` in
+     "       1") printf "[\e[0;32mUP\e[0m]  "    ;;
+     "       0") printf "[\e[0;31mDOWN\e[0m]"   ;;
+   esac
+   printf "  02(8094)="
+   case `ps -ef|grep org.apache.kafka.connect.cli.ConnectDistributed|grep -v grep|grep 8094|wc -l` in
+     "       1") printf "[\e[0;32mUP\e[0m]  "    ;;
+     "       0") printf "[\e[0;31mDOWN\e[0m]"   ;;
+   esac
+   printf "\n                 03(8095)="
+   case `ps -ef|grep org.apache.kafka.connect.cli.ConnectDistributed|grep -v grep|grep 8095|wc -l` in
+     "       1") printf "[\e[0;32mUP\e[0m]"    ;;
+     "       0") printf "[\e[0;31mDOWN\e[0m]"   ;;
+   esac
+   printf "  04(8096)="
+   case `ps -ef|grep org.apache.kafka.connect.cli.ConnectDistributed|grep -v grep|grep 8096|wc -l` in
+     "       1") printf "[\e[0;32mUP\e[0m]"    ;;
+     "       0") printf "[\e[0;31mDOWN\e[0m]"   ;;
+   esac
+}
+
+
+
+runSql()
+{
+case $1 in
+"createStTopic") 
+   echo;echo;echo
+   printf "${Gre}CREATE STREAM ST_TOPIC "
+   printf "\nWITH (kafka_topic='GDELT_EVENT', value_format='AVRO',partitions=4);${RESET}"
+   echo "CREATE STREAM ST_TOPIC WITH (kafka_topic='GDELT_EVENT', value_format='AVRO',partitions=4);" | ksql
+   Pause
+   ;;
+"createStStream") 
+   echo "CREATE STREAM ST_STREAM AS SELECT *,URL_EXTRACT_HOST(SOURCEURL) as SITE FROM ST_TOPIC;" | ksql
+   Pause
+   ;;
+"createStFilterGeo") 
+   echo " "
+   printf "${Gre}CREATE  STREAM ST_FILTER_GEO AS "
+   printf "\n      SELECT   *"
+   printf "\n             , URL_EXTRACT_HOST(SOURCEURL)        as SITE"
+   printf "\n             , ACTOR1GEO_LAT + ','+ACTOR1GEO_LONG as LOCATION"
+   printf "\n             , 'POINT('+ACTOR1GEO_LONG + ' '+ACTOR1GEO_LAT+')' as GEOGRAPHY "
+   printf "\n        FROM ST_TOPIC "
+   printf "\n       WHERE ACTOR1GEO_LAT > '';${RESET}"
+   echo " "
+   echo " "
+   echo "CREATE STREAM ST_FILTER_GEO AS SELECT *,URL_EXTRACT_HOST(SOURCEURL) as SITE,ACTOR1GEO_LAT + ','+ACTOR1GEO_LONG as LOCATION, 'POINT('+ACTOR1GEO_LONG + ' '+ACTOR1GEO_LAT+')' as GEOGRAPHY FROM ST_TOPIC WHERE ACTOR1GEO_LAT>'' ;" | ksql
+   Pause
+   ;;
+"createTbGroupBy") 
+   echo "CREATE TABLE TB_GROUPBY AS SELECT SITE as SITE , cast(count(*) as bigint) as C_COUNT , SUM(cast(AVGTONE as DOUBLE)) / COUNT(*) as C_AVGTONE , max(cast(AVGTONE as DOUBLE)) as C_MAXTONE , min(cast(AVGTONE as DOUBLE)) as C_MINTONE , cast(MAX(cast(EVENTID as bigint)) as STRING) as LAST_EVENTID FROM ST_STREAM GROUP BY SITE;" | ksql
+   Pause
+   ;;
+"reKey1")
+   echo "CREATE STREAM ST_REKEY1  WITH (KAFKA_TOPIC='TB_GROUPBY', VALUE_FORMAT='AVRO');" | ksql
+   Pause
+   ;;
+"reKey2")
+   echo "CREATE STREAM ST_REKEY2 WITH (VALUE_FORMAT='AVRO') AS SELECT SITE,C_COUNT,C_AVGTONE,C_MAXTONE,C_MINTONE,LAST_EVENTID FROM ST_REKEY1 PARTITION BY LAST_EVENTID;" | ksql
+   Pause
+   ;;
+"stEnriched")
+   echo "CREATE STREAM ST_STREAM_ENRICHED  WITH (value_format='AVRO') AS SELECT EVENTID, ST_STREAM.SITE as SITE, cast(C_COUNT as INT) as C_COUNT,AVGTONE, C_MINTONE, C_AVGTONE, C_MAXTONE, ACTOR1GEO_LAT,ACTOR1GEO_LONG,SOURCEURL FROM ST_STREAM JOIN ST_REKEY2 WITHIN 60 SECONDS ON (EVENTID=LAST_EVENTID);" | ksql
+   Pause
+   ;;
+"showStreams") 
+   clear
+   echo "SHOW STREAMS;" | ksql
+   Pause
+   ;;
+"showTopics") 
+   clear
+   echo "SHOW TOPICS;" | ksql|grep -v "connect-"|grep -v "_confluent-"|grep -v "_schemas"|grep -v "default_ksql_processing_log"
+   Pause
+   ;;
+esac
+
+}
+
+
+
+showTopics()
+{
+kafka-topics --bootstrap-server ${Bootstrap_Servers}:9092 --list > t.txt
+
+cat t.txt|sort|grep connect  |tr '\n' ', ' > t.connect.txt
+cat t.txt|sort|grep GDELT    |tr '\n' ', ' > t.GDELT.txt
+cat t.txt|sort|grep onfluent |tr '\n' ', ' > t.confluent.txt
+cat t.txt|sort|grep schema   |tr '\n' ', ' > t.schema.txt
+cat t.txt|sort|grep onsumer  |tr '\n' ', ' > t.consumer.txt
+
+
+echo;echo;echo "Topics in Kafka Server ${Bootstrap_Servers}:"
+echo "        Connect: "`cat t.connect.txt`
+echo "      Confluent: "`cat t.confluent.txt`
+echo "          GDELT: "`cat t.GDELT.txt`
+echo "Schema Registry: "`cat t.schema.txt`
+echo "Consumer Offset: "`cat t.consumer.txt`
+rm t.*.txt
+echo;echo "Hit Return.."
+read Paused
+}
+
+
+
+
+
+
+
+
+getConnectPID()
+{
+  C_PORT=$(getConnectPort $1)
+  PID=`ps -ef|grep org.apache.kafka.connect.cli.ConnectDistributed|grep -v grep|grep -v connect.properties|grep ${C_PORT}| awk '{print $2}'`
+  echo ${PID}
+}
+
+killConnect()
+{
+  C_PORT=$(getConnectPort $1)
+     PID=$(getConnectPID ${1})
+  if [ "${PID}" != "" ]
+  then
+    printf "\n${Gre}killing Kafka-Connect (connect distributed) server number ${1} single-node on port ${C_PORT} as PID ${PID}${RESET}"
+    kill -9 ${PID}
+  else 
+    printf "\n${Red}Not running! No Kafka-Connect (connect distributed) server number ${1} single-node on port ${C_PORT}${RESET}"
+  fi
+  Pause
+}
+
+
+genCcloudConfigs()
+{
+  if [[ -d "${WORKDIR}/delta_configs" ]]
+  then
+    echo "(I) Confluent Cloud configs found in ${WORKDIR}/delta_configs"
+    . ${WORKDIR}/delta_configs/env.delta
+  else
+    echo "(I) Generating config files for Confluent Cloud (${P_BROKER})"
+    run_ccloud_generate_configs
+    echo "(I) Done"
+  fi
+}
+
+
+setEnvConfluentPlatform()
+{
+    printf "${Gre}  Last Confluent Platform used in this menu was ${P_BROKER}. Using it again ${RESET}\n"
+
+    export CP_LINE="${Gre}[On-prem]${RESET}  [GCP]  [AWS]  [Azure]  [Docker]  [Kubernetes]"
+    case ${P_BROKER} in
+     CLOUD_GOOGLE) export CP_LINE="[On-prem]  ${Gre}[GCP]${RESET}  [AWS]  [Azure]  [Docker]  [Kubernetes]" 
+                   #setConnectAuthentication GCP
+                   ;;
+     CLOUD_AWS) export CP_LINE="[On-prem]  [GCP]  ${Gre}[AWS]${RESET}  [Azure]  [Docker]  [Kubernetes]" 
+                #setConnectAuthentication AWS
+                ;;
+     CLOUD_AZURE) export CP_LINE="[On-prem]  [GCP]  [AWS]  ${Gre}[Azure]${RESET}  [Docker]  [Kubernetes]" ;;
+     DOCKER) export CP_LINE="[On-prem]  [GCP]  [AWS]  [Azure]  ${Gre}[Docker]${RESET}  [Kubernetes]" ;;
+     KUBERNETES) export CP_LINE="[On-prem]  [GCP]  [AWS]  [Azure]  [Docker]  ${Gre}[Kubernetes]${RESET}" ;;
+     ONPREM) export CP_LINE="${Gre}[On-prem]${RESET}  [GCP]  [AWS]  [Azure]  [Docker]  [Kubernetes]" ;;
+    esac
+#  else 
+#    echo "ONPREM" > ${WORKDIR}/last_confluent_platform.txt
+#    export P_BROKER='ONPREM'
+#    export CP_LINE="[On-prem]  ${Gre}[GCP]${RESET}  [AWS]  [Azure]  [Docker]  [Kubernetes]" 
+#    printf "${Gre}[On-prem]${RESET}  [GCP]  [AWS]  [Azure]  [Docker]  [Kubernetes]"
+#    export CP_LINE="${Gre}[On-prem]${RESET}  [GCP]  [AWS]  [Azure]  [Docker]  [Kubernetes]"
+#  fi
+}
+
+toggleConfluentVersion()
+{
+case ${P_CONFLUENT_VERSION} in
+     5.2) export P_CONFLUENT_VERSION=5.3
+          cd ~
+          if [[ -L "./confluent" ]]
+          then
+            rm confluent
+            ln -s confluent-5.3.0-SNAPSHOT confluent
+          fi 
+     ;;
+     5.3) export P_CONFLUENT_VERSION=5.2
+          cd ~
+          if [[ -L "./confluent" ]]
+          then
+            rm confluent
+            ln -s confluent-5.2.0 confluent
+          fi 
+     ;;
+esac
+setPar P_CONFLUENT_VERSION ${P_CONFLUENT_VERSION}
+}
+
+#toggleTopicForElastic()
+#{
+#case ${TOPIC_FOR_ELASTIC} in
+#     GDELT_EVENT) export TOPIC_FOR_ELASTIC=ST_FILTER_GEO
+#     ;;
+#     ST_FILTER_GEO) export TOPIC_FOR_ELASTIC=GDELT_EVENT
+#     ;;
+#esac
+#}
+
+
+toggleJdbcSource()
+{
+case ${JDBC_TABLE} in
+   NONE) 
+       export JDBC_TABLE="MST_SCORING"
+       export   JDBC_URL="jdbc:oracle:thin:10.20.215.207:1525:dpoc"
+       export  JDBC_MODE="bulk"
+       export  JDBC_ICOL=""
+       export    JDBC_MS="3000"
+       export  JDBC_USER="gdelt"
+       export  JDBC_PASS="gdelt_pw"
+   ;;
+   MST_SCORING) 
+       export JDBC_TABLE="NONE"
+       export   JDBC_URL="jdbc:postgresql://localhost/db_gdelt?currentSchema=public"
+       export  JDBC_MODE="bulk"
+       export  JDBC_ICOL=""
+       export    JDBC_MS="3000"
+       export  JDBC_USER="gdelt"
+       export  JDBC_PASS="gdelt_pw"
+   ;;
+esac
+}
+
+
+toggleSqliteConnectMode()
+{
+case ${SQLITE_CONNECT_MODE} in
+     incrementing) export SQLITE_CONNECT_MODE=incrememnting+timestamp
+     ;;
+     incrememnting+timestamp) export SQLITE_CONNECT_MODE=bulk
+     ;;
+     bulk) export SQLITE_CONNECT_MODE=query
+     ;;
+     query) export SQLITE_CONNECT_MODE=incrementing
+     ;;
+esac
+}
+
+
+toggleSerdes()
+{
+case ${P_SERDES} in
+     AVRO) export P_SERDES=JSON
+           export SERDEX_JAR=org.apache.kafka.connect.json.JsonConverter
+           export TRANSFORM=
+     ;;
+     JSON) export P_SERDES=STRING
+           export SERDES_JAR=org.apache.kafka.connect.storage.StringConverter
+           export TRANSFORM=
+     ;;
+     STRING) export P_SERDES=BYTEARRAY
+             export SERDES_JAR=org.apache.kafka.connect.converters.ByteArrayConverter
+             export VALUE_SCHEMA='{\"name\":\"schema.struct\" ,\"type\":\"STRUCT\",\"isOptional\":true,\"fieldSchemas\":{\"KEY\":{\"type\":\"STRING\",\"isOptional\":true},\"VALUE\":{\"type\":\"INT64\",\"isOptional\":true}'
+             export TRANSFORM='"transforms":"HoistField","transforms.HoistField.type":"org.apache.kafka.connect.transforms.HoistField$Value","transforms.HoistField.field":"line"'
+     ;;
+     BYTEARRAY) export P_SERDES=PROTOBUF
+                export SERDES_JAR=com.blueapron.connect.protobuf.ProtobufConverter
+                export TRANSFORM=
+     ;;
+     PROTOBUF) export P_SERDES=AVRO
+               export SERDES_JAR=io.confluent.connect.avro.AvroConverter
+               export TRANSFORM=
+
+     ;;
+esac
+}
+
+
+
+toggleSchemaRegistry()
+{
+if [[ "$1" = "toggle" && "$2" = "ONPREM" ]] || [[ "$1" = "set" && "$2" = "CLOUD" ]]
+then
+             export P_SCHEMA_REGISTRY=CLOUD
+             # Kafka Connect properties
+             export Schema_Registry="https://psrc-lo3do.us-east-2.aws.confluent.cloud"
+             export SR_Key=RB76WSQ5KIPGKOQL
+             export SR_Secret=e4BJbJSPtVY1wxVMzZjqIjmIhrBy1STqBEb7mwsTAJnCZUEMX+Kb5sQFp4NjJN7w
+             #export CONNECT_SR1="                          schema.registry.url=${Schema_Registry}"
+             #export CONNECT_SR2="schema.registry.basic.auth.credentials.source=USER_INFO"
+             #export CONNECT_SR3="value.converter.basic.auth.credentials.source=USER_INFO"
+             #export CONNECT_SR4="value.converter.basic.auth.user.info=${SR_Key}:${SR_Secret}"
+             #export CONNECT_SR5=" value.converter.schema.registry.url=${Schema_Registry}"
+             #export CONNECT_SR6=""
+             #export CONNECT_SR7=""
+fi
+if [[ "$1" = "toggle" && "$2" = "CLOUD" ]] || [[ "$1" = "set" && "$2" = "ONPREM" ]]
+then
+             export P_SCHEMA_REGISTRY=ONPREM
+             export Schema_Registry="http://localhost:8081/"
+             #export CONNECT_SR1="schema.registry.url=${Schema_Registry}"
+             #export CONNECT_SR2=""
+             #export CONNECT_SR3=""
+             #export CONNECT_SR4=""
+             #export CONNECT_SR5=""
+             #export CONNECT_SR6=""
+             #export CONNECT_SR7=""
+fi
+setPar P_SCHEMA_REGISTRY  ${P_SCHEMA_REGISTRY}
+}
+
+
+
+
+toggleConfluentPlatform()
+{
+case ${P_BROKER} in
+     ONPREM) export P_BROKER=CLOUD_GOOGLE
+             export CP_LINE="[On-prem]  ${Gre}[GCP]${RESET}  [AWS]  [Azure]  [Docker]  [Kubernetes]"
+             #setConnectAuthentication GCP
+     ;;
+     CLOUD_GOOGLE) export P_BROKER=CLOUD_AWS
+             export CP_LINE="[On-prem]  [GCP]  ${Gre}[AWS]${RESET}  [Azure]  [Docker]  [Kubernetes]"
+             #setConnectAuthentication AWS
+     ;;
+     CLOUD_AWS) export P_BROKER=CLOUD_AZURE
+             export CP_LINE="[On-prem]  [GCP]  [AWS]  ${Gre}[Azure]${RESET}  [Docker]  [Kubernetes]"
+             #setConnectAuthentication AWS
+     ;;
+     CLOUD_AZURE) export P_BROKER=DOCKER
+             export CP_LINE="[On-prem]  [GCP]  [AWS]  [Azure]  ${Gre}[Docker]${RESET}  [Kubernetes]"
+     ;;
+     DOCKER) export P_BROKER=KUBERNETES
+             export CP_LINE="[On-prem]  [GCP]  [AWS]  [Azure]  [Docker]  ${Gre}[Kubernetes]${RESET}"
+     ;;
+     KUBERNETES) export P_BROKER=ONPREM
+             export CP_LINE="${Gre}[On-prem]${RESET}  [GCP]  [AWS]  [Azure]  [Docker]  [Kubernetes]"
+     ;;
+esac
+     setPar P_BROKER ${P_BROKER}
+}
+
+
+toggleGroupId()
+{
+case ${CGID} in
+     A) export CGID=B
+     ;;
+     B) export CGID=C
+     ;;
+     C) export CGID=D
+     ;;
+     D) export CGID=A
+     ;;
+esac
+}
+
+toggleConnectServer()
+{
+case ${CS} in
+     01) export CS=02
+         export CGID=B
+     ;;
+     02) export CS=03
+         export CGID=C
+     ;;
+     03) export CS=04
+         export CGID=D
+     ;;
+     04) export CS=01
+         export CGID=A
+     ;;
+esac
+}
+
+
+toggleCompression()
+{
+case ${COMPRESSION} in
+NONE) export COMPRESSION=ZSTD
+;;
+ZSTD) export PAR=SNAPPY
+;;
+SNAPPY) export PAR=GZIP
+;;
+GZIP) export PAR=NONE
+;;
+esac
+echo ${COMPRESSION} > ${WORKDIR}/topic_compression.txt
+}
+
+
+
+togglePartitions()
+{
+case ${PAR} in
+1) export PAR=2
+;;
+2) export PAR=4
+;;
+4) export PAR=5
+;;
+5) export PAR=8
+;;
+8) export PAR=16
+;;
+16) export PAR=32
+;;
+32) export PAR=1
+;;
+esac
+}
+
+toggleConnectLogLevel()
+{
+case ${C_LOGLEVEL} in
+"INFO") export C_LOGLEVEL=WARN
+;;
+"WARN") export C_LOGLEVEL=ERROR
+;;
+"ERROR") export C_LOGLEVEL=DEBUG
+;;
+"DEBUG") export C_LOGLEVEL=INFO
+;;
+esac
+}
+
+
+menus()
+{
+clear
+if [ "${1}" = "l0_main" ]
+then
+export menu=$1
+cat <<EOF
+${CONFLUENT_STATUS}
+${CONNECT_STATUS}
+
+
+
+
+
+
+
+8. CDR Demo
+
+_____________________________________
+Enter an Option::
+EOF
+fi
+
+###############
+if [ "${1}" = "l1_confluent" ]
+then
+export menu=$1
+cat <<EOF
+1. start
+2. stop
+3. destroy
+4. toggle Confluent Version [$P_CONFLUENT_VERSION]
+
+Enter an Option: 
+EOF
+fi
+###############
+###############
+if [ "${1}" = "l1_topics" ]
+then
+export menu=$1
+cat <<EOF
+         ****************************
+         *         Topics           *
+         ****************************
+1. partitions=${PAR}
+2. (re)create topic ${P_TOPIC_NAME}
+3. 
+4. 
+5. describe everything
+6. set topic name [${P_TOPIC_NAME}]
+
+Enter an Option: 
+EOF
+fi
+###############
+###############
+if [ "${1}" = "l1_connect" ]
+then
+export menu=$1
+cat <<EOF
+         ****************************
+         *        Connect           *
+         ****************************
+1. Connect Distributed
+2. Plugins
+
+Enter an Option: 
+EOF
+fi
+###############
+if [ "${1}" = "l1_data" ]
+then
+export menu=$1
+cat <<EOF
+         ****************************
+         *          Data            *
+         ****************************
+1. GDELT (spooldir)
+2. GDELT (postgres)
+
+Enter an Option: 
+EOF
+fi
+
+###############
+if [ "${1}" = "l1_apps" ]
+then
+export menu=$1
+cat <<EOF
+         ****************************
+         * Databases / Applications *
+         ****************************
+1. Postgres
+2. Elastic
+3. SQLite
+
+Enter an Option: 
+EOF
+fi
+
+if [ "${1}" = "l1_cdr_demo" ]
+then
+export menu=$1
+cat <<EOF
+         ****************************
+         *       CDR Demo           *
+         ****************************
+
+Docker Image is ${STATUS_CONNECT_DOCKER_IMAGE}.
+
+1. Set CDRs per file [ ${P_CDRS_PER_FILE} ]
+2. Set number of files [ ${P_CDR_FILES} ]
+3. Toggle Producer Compression [ ${P_PRODUCER_COMPRESSION} ]
+4. Set linger.ms [ ${P_LINGER_MS} ]
+5. Set  batch.size [ ${P_BATCH_SIZE} ]
+6. Rebuild Docker image [ ${P_DOCKER_IMAGE_STATUS} ]
+7. Run CDR Load
+8. Regenerate Confluent Cloud config files
+
+
+Enter an Option: 
+EOF
+fi
+###############
+###############
+if [ "${1}" = "l1_ksql" ]
+then
+export menu=$1
+cat <<EOF
+         ****************************
+         *          Ksql            *
+         ****************************
+1. GDELT
+
+Object Name: ${KSQL_OBJECT} 
+Objects:   :                k0. Set Object
+Object                      k1. Create
+ST_MST_CUSTOMER             k2. Drop
+ST_MST_SCORING              k3. Query
+ST_MQ_PARSED                k4. Describe
+ST_CUST_SCORING             k5. cConsume
+ST_MQ_SCORED                k6. edit cmds
+
+
+Enter an Option: 
+EOF
+fi
+###############
+if [ "${1}" = "l1_setup" ]
+then
+export menu=$1
+cat <<EOF
+         ****************************
+         *         Setup            *
+         ****************************
+1. modify confluent properties files
+2. remove un-needed connect plugins
+3. run BCA tests
+
+
+Enter an Option: 
+EOF
+fi
+
+###############
+if [ "${1}" = "l2_connectDistributed" ]
+then
+export menu=$1
+cat <<EOF
+         ****************************
+         *    Connect Distributed   *
+         ****************************
+1. start
+2. stop
+3. toggle Connect Server [${CS}]
+4. toggle Group.ID [${CGID}]
+5. toggle Converter [${P_SERDES}]
+6. toggle Schema Registry [${P_SCHEMA_REGISTRY}]
+7. toggle log4j.root.loglevel [$C_LOGLEVEL]
+7. [init]
+
+
+Enter an Option: 
+EOF
+fi
+###############
+if [ "${1}" = "l2_plugins" ]
+then
+export menu=$1
+cat <<EOF
+         ****************************
+         *        Plugins           *
+         ****************************
+   SOURCE         SINK
+============    ===========
+ 1. spooldir
+ 7. SQLite
+ 8. IBM MQ
+                 2. bigquery
+                 3. postgres
+                 6. Elastic
+ 4. MQTT         5. MQTT
+ 9. JDBC        10. JDBC
+11. Data Diode  12. Data Diode
+13. Replicator
+
+Enter an Option: 
+EOF
+fi
+###############
+if [ "${1}" = "l2_elastic" ]
+then
+export menu=$1
+cat <<EOF
+         ***************************
+         *    Elastic & Kibana     *
+         ***************************
+1. start
+2. stop
+3. check 
+4. init 
+
+
+Enter an Option: 
+EOF
+fi
+###############
+###############
+if [ "${1}" = "l2_sqlite" ]
+then
+export menu=$1
+cat <<EOF
+         **************************
+         *         SQLite         *
+         **************************
+1. Change # tables [${SQLITE_TABLES}]
+2. set number of tables
+3. Remember ...
+4. init 
+
+
+Enter an Option: 
+EOF
+fi
+###############
+
+
+if [ "${1}" = "l2_postgres" ]
+then
+export menu=$1
+cat <<EOF
+         ***************************
+         *        Postgres         *
+         ***************************
+1. start
+2. stop
+3. check 
+4. init 
+
+
+Enter an Option: 
+EOF
+fi
+###############
+if [ "${1}" = "l3_spooldir" ]
+then
+export menu=$1
+cat <<EOF
+         ****************************
+         *        spooldir          *
+         ****************************
+1. submit
+2. un-submit
+3. toggle connect server [${CS}]
+4. check 
+5. list connect jobs
+
+
+Enter an Option: 
+EOF
+fi
+###############
+###############
+if [ "${1}" = "l3_elasticSink" ]
+then
+export menu=$1
+cat <<EOF
+         ****************************
+         *        Elastic (sink)   *
+         ****************************
+1. submit
+2. un-submit
+3. toggle connect server [${CS}]
+4. check 
+5. toggle topic name [$P_TOPIC_NAME]
+7. init 
+
+
+Enter an Option: 
+EOF
+fi
+###############
+if [ "${1}" = "l3_bigquerySink" ]
+then
+export menu=$1
+cat <<EOF
+         ****************************
+         *        bigquery (sink)   *
+         ****************************
+1. submit
+2. un-submit
+3. toggle connect server [${CS}]
+4. check 
+5. init 
+
+
+Enter an Option: 
+EOF
+fi
+###############
+if [ "${1}" = "l3_postgresSink" ]
+then
+export menu=$1
+cat <<EOF
+         ****************************
+         *      postgres (sink)     *
+         ****************************
+1. submit
+2. un-submit
+3. toggle connect server [${CS}]
+4. check 
+5. init 
+
+
+Enter an Option: 
+EOF
+fi
+###############
+if [ "${1}" = "l3_sqliteSource" ]
+then
+export menu=$1
+cat <<EOF
+         ****************************
+         *      SQLite (source)     *
+         ****************************
+1. submit
+2. un-submit
+3. toggle connect server [${CS}]
+4. check 
+5. toggle mode [${SQLITE_CONNECT_MODE}]
+6. init 
+
+
+Enter an Option: 
+EOF
+fi
+###############
+if [ "${1}" = "l3_mqttSource" ]
+then
+export menu=$1
+cat <<EOF
+         ****************************
+         *        MQTT (source)     *
+         ****************************
+1. submit
+2. un-submit
+3. toggle connect server [${CS}]
+4. check 
+5. init 
+
+
+Enter an Option: 
+EOF
+fi
+###############
+if [ "${1}" = "l3_mqttSink" ]
+then
+export menu=$1
+cat <<EOF
+         ****************************
+         *        MQTT  (sink)      *
+         ****************************
+1. submit
+2. un-submit
+3. toggle connect server [${CS}]
+4. check 
+5. init 
+
+
+Enter an Option: 
+EOF
+fi
+###############
+if [ "${1}" = "l3_MQSource" ]
+then
+export menu=$1
+cat <<EOF
+         ****************************
+         *        MQ (source)     *
+         ****************************
+1. submit
+2. un-submit
+3. toggle connect server [${CS}]
+4. check 
+5. init 
+
+
+Enter an Option: 
+EOF
+fi
+###############
+if [ "${1}" = "l3_JdbcSource" ]
+then
+export menu=$1
+cat <<EOF
+         ****************************
+         *        JDBC (source)     *
+         ****************************
+1. submit
+2. un-submit
+3. toggle connect server [${CS}]
+4. check 
+5. init 
+6. toggle table [${JDBC_TABLE}]
+
+Enter an Option: 
+EOF
+fi
+if [ "${1}" = "l3_JdbcSink" ]
+then
+export menu=$1
+cat <<EOF
+         ****************************
+         *         JDBC (sink)      *
+         ****************************
+1. submit
+2. un-submit
+3. toggle connect server [${CS}]
+4. check 
+5. init 
+6. toggle table [${JDBC_TABLE}]
+
+Enter an Option: 
+EOF
+fi
+###############
+if [ "${1}" = "l3_Replicator" ]
+then
+export menu=$1
+cat <<EOF
+         ****************************
+         *   Confluent Replicator   *
+         ****************************
+1. submit
+2. un-submit
+3. toggle connect server [${CS}]
+4. check
+
+Enter an Option:
+EOF
+fi
+###############
+if [ "${1}" = "l2_GdeltSpooldir" ]
+then
+export menu=$1
+if [ "$GDELT_COUNT_ROWS" = "Y" ]
+then
+  countEvents
+  PRINT_GDELT_TOTAL_COUNT=`echo $GDELT_TOTAL_COUNT| sed 's/\([[:digit:]]\{3\}\)\([[:digit:]]\{3\}\)\([[:digit:]]\{3\}\)/\1,\2,\3/g'`
+  GDELT_COUNT_ROWS=N
+fi
+cat <<EOF
+         ****************************
+         *       Data - GDELT       * 
+         ****************************
+EOF
+
+printf "${Gre}  News Items = ${PRINT_GDELT_TOTAL_COUNT}  ${RESET} \n"
+cat <<EOF
+
+1. produce 1 event
+2. Offset=${OF} Batch Size=${P_BATCHSIZE}
+3. Loops=${P_LOOPS}
+4. Interval Secs=${P_INTERVAL_SECS}
+5. Run
+
+Enter an Option: 
+EOF
+fi
+
+###############
+if [ "${1}" = "l2_GdeltPostgres" ]
+then
+export menu=$1
+if [ "$GDELT_COUNT_ROWS" = "Y" ]
+then
+  countEvents
+  PRINT_GDELT_TOTAL_COUNT=`echo $GDELT_TOTAL_COUNT| sed 's/\([[:digit:]]\{3\}\)\([[:digit:]]\{3\}\)\([[:digit:]]\{3\}\)/\1,\2,\3/g'`
+  GDELT_COUNT_ROWS=N
+fi
+cat <<EOF
+         ****************************
+         *     GDELT - Postgres     * 
+         ****************************
+EOF
+
+printf "${Gre}  News Items = ${PRINT_GDELT_TOTAL_COUNT}  ${RESET} \n"
+cat <<EOF
+
+1. Create events table
+2. Offset=${OF} Batch Size=${P_BATCHSIZE}
+3. Loops=${IT}
+4. Interval Secs=${P_INTERVAL_SECS}
+5. Run
+
+Enter an Option: 
+EOF
+fi
+
+###############
+###############
+if [ "${1}" = "l2_ksqlGdelt" ]
+then
+export menu=$1
+cat <<EOF
+         ****************************
+         *       kSQL - GDELT       * 
+         ****************************
+1. ST_STREAM
+2. TB_GROUPBY
+3. ST_REKEY1
+4. ST_REKEY2
+5. ST_STREAM_ENRICHED
+
+
+Enter an Option: 
+EOF
+fi
+}
+
+
+
+
+
+
+
+
+
+
+
+#######################################################################################################################
+##starthere start here starts
+#######################################################################################################################
+  mkdir ${KEEPLOGS} 2>/dev/null
+  export P_BROKER=`getPar P_BROKER CLOUD_GOOGLE`
+  setEnvConfluentPlatform
+  export P_TOPIC_NAME=`getPar P_TOPIC_NAME GDELT_EVENT`
+  export P_SCHEMA_REGISTRY=`getPar P_SCHEMA_REGISTRY ONPREM`
+  export P_SERDES=`getPar P_SERDES AVRO`
+  export P_CONFLUENT_VERSION=`getPar P_CONFLUENT_VERSION 5.3`
+  export P_BATCHSIZE=`getPar P_BATCHSIZE 20000`
+  export P_LOOPS=`getPar P_LOOPS 50`
+  export P_INTERVAL_SECS=`getPar P_INTERVAL_SECS 2`
+  export P_CONNECT_TIMEOUT=`getPar P_CONNECT_TIMEOUT 5000`
+  export P_BUFFER_MEMORY=`getPar P_BUFFER_MEMORY 33554432`
+  export P_LINGER_MS=`getPar P_LINGER_MS 2000`
+  export P_BATCH_SIZE=`getPar P_BATCH_SIZE 16384`
+  export P_PRODUCER_COMPRESSION=`getPar P_PRODUCER_COMPRESSION none`
+  export P_DOCKER_REL=`getPar P_DOCKER_REL 1`
+  export P_CDRS_PER_FILE=`getPar P_CDRS_PER_FILE 50000`
+  export P_CDR_FILES=`getPar P_CDR_FILES 300`
+  export P_DOCKER_IMAGE_STATUS=`getPar P_DOCKER_IMAGE_STATUS stale`
+  export P_GITHUB_REPO=`getPar P_GITHUB_REPO markteehan`
+  export P_CC_BOOTSTRAP_SERVERS=`getPar P_CC_BOOTSTRAP_SERVERS UNSET`
+  export GKE_BASE_CONNECT_REPLICAS=`getPar GKE_BASE_CONNECT_REPLICAS 10`
+  CONFIG_FILE=~/.ccloud/config
+  export SASL_JAAS_CONFIG=$( grep "^sasl.jaas.config" $CONFIG_FILE | cut -d'=' -f2- )
+
+
+if [[ -f ~/.profile ]]
+then
+  . ~/.profile
+fi
+
+if [[ ! -f ~/.ccloud/config ]]
+then
+  echo;echo;echo "Unable to find Cloud Configuration files in ~/.ccloud/config"
+  echo "After setup of Confluent Cloud, follow the steps to populate config files in .ccloud/config, the restart"
+  exit 255
+fi
+
+  genCcloudConfigs
+if [[ ! -f ${WORKDIR}/delta_configs/env.delta ]]
+then
+  echo "Unable to generate delta configs in ${WORKDIR}/delta_configs. Please check and restart"
+  exit 255
+fi
+
+  checkGCPProject
+
+
+mkdir -p ${WORKDIR} 2>/dev/null
+while true
+do
+  # Refresh the Active list for Database and Table
+  #echo "not running SetDefaults"
+  menus $menu
+  read option
+  lastCmd=${option}
+case $menu in
+"l0_main") menus ${menu}
+           case $option in
+           "1") menus l1_confluent
+                ;;
+           "2") menus l1_topics
+                ;;
+           "3") menus l1_connect
+                ;;
+           "4") menus l1_apps
+                ;;
+           "5") menus l1_data
+                ;;
+           "6") menus l1_ksql
+                ;;
+           "7") toggleConfluentPlatform
+                ;;
+           "8") menus l1_cdr_demo
+                ;;
+           "9") menus l1_setup
+                ;;
+           "x") menu=l0_main
+                ;;
+           esac
+           ;;
+"l1_confluent") menus ${menu}
+           case $option in
+           "1") echo "confluent start" > ${WORKDIR}/confluent.start.ksh
+                echo "confluent start" >> ${WORKDIR}/confluent.start.ksh
+                echo "confluent stop connect" >> ${WORKDIR}/confluent.start.ksh
+                cd ${WORKDIR}
+                nohup sh ${WORKDIR}/confluent.start.ksh & 
+                printf "${Gre}Confluent services starting (background) ...${RESET} \n"
+                Pause
+                ;;
+           "2") confluent stop
+                Pause
+                ;;
+           "3") confluent destroy
+                Pause
+                ;;
+           "4") toggleConfluentVersion
+                Pause
+                ;;
+           "x") menu=l0_main
+                ;;
+           esac
+           ;;
+"l1_topics") menus ${menu}
+           case $option in
+           "1") togglePartitions
+                ;;
+           "2") createTopic ${P_TOPIC_NAME}
+                ;;
+           "3") createTopic mqtt_${DT2}
+                ;;
+           "4") runSql showTopics
+                ;;
+           "5") describeEverything
+                ;;
+           "6") setTopicName
+                ;;
+           "x")  menu=l0_main
+                ;;
+           esac
+           ;;
+"l1_cdr_demo") menus ${menu}
+           case $option in
+           "1") setCdrsPerFile
+                ;;
+           "2") setCdrFiles
+                ;;
+           "3") setProducerCompression
+                ;;
+           "4") setLingerMs
+                ;;
+           "5") setBatchSize
+                ;;
+           "6") ReBuildDockerImages
+                ;;
+           "7") runCDRDemo
+                ;;
+           "8") 
+                run_ccloud_generate_configs
+                ;;
+           "x") menu=l0_main
+                ;;
+           esac
+           ;;
+"l1_data") menus ${menu}
+           case $option in
+           "1") menus l2_GdeltSpooldir
+                ;;
+           "2") menus l2_GdeltPostgres
+                ;;
+           "x") menu=l0_main
+                ;;
+           esac
+           ;;
+"l1_apps") menus ${menu}
+           case $option in
+           "1") menus l2_postgres
+                ;;
+           "2") menus l2_elastic
+                ;;
+           "3") menus l2_sqlite
+                ;;
+           "x") menu=l0_main
+                ;;
+           esac
+           ;;
+"l1_connect") menus ${menu}
+           case $option in
+           "1") menus l2_connectDistributed
+                ;;
+           "2") menus l2_plugins
+                ;;
+           "x") menu=l0_main
+                ;;
+           esac
+           ;;
+"l2_connectDistributed") menus ${menu}
+           case $option in
+           "1") startConnect $CS
+                ;;
+           "2") killConnect $CS
+                ;;
+           "3") toggleConnectServer
+                ;;
+           "4") toggleGroupId
+                ;;
+           "5") toggleSerdes
+                ;;
+           "6") toggleSchemaRegistry toggle ${P_SCHEMA_REGISTRY}
+                ;;
+           "7") toggleConnectLogLevel
+                ;;
+           "7") initConnect
+                ;;
+           "x") menu=l1_connect
+                ;;
+          esac
+          ;;
+"l2_plugins") menus ${menu}
+           case $option in
+           "1") menus l3_spooldir
+                ;;
+           "2") menus l3_bigquerySink
+                ;;
+           "3") menus l3_postgresSink
+                ;;
+           "4") menus l3_mqttSource
+                ;;
+           "5") menus l3_mqttSink
+                ;;
+           "6") menus l3_elasticSink
+                ;;
+           "7") menus l3_sqliteSource
+                ;;
+           "8") menus l3_MQSource
+                ;;
+           "9") menus l3_JdbcSource
+                ;;
+           "10") menus l3_JdbcSink
+                ;;
+           "11") menus l3_Replicator
+                ;;
+           "x") menu=l1_connect
+                ;;
+          esac
+          ;;
+"l2_elastic") menus ${menu}
+           case $option in
+           "1") case `uname` in
+                  "Linux") echo not implemented yet ;;
+                 "Darwin") cd ~/elasticsearch-6.4.2
+                          printf "${Gre}ElasticSearch starting..${RESET} \n"
+                          nohup bin/elasticsearch &
+                          sleep 3
+                          cd ~/kibana*
+                          printf "${Gre}Kibana starting..${RESET} \n"
+                          nohup bin/kibana &
+                          printf "${Gre} Click on http://localhost:5601/app/kibana#/management/kibana/indices/ ${RESET}"
+                          Pause
+                ;;
+                esac
+                Pause
+                ;;
+           "2") case `uname` in
+                "Darwin") killElastic  ;;
+                 "Linux") killElastic  ;; 
+                esac
+                Pause
+                ;;
+           "3") 
+                Pause
+                ;;
+           "4") initElastic
+                ;;
+           "x") menu=l1_apps
+                ;;
+           esac
+           ;;
+"l2_postgres") menus ${menu}
+           case $option in
+           "1") case `uname` in
+                "Darwin") brew services start postgresql  ;;
+                 "Linux") echo not Implemented;;
+                esac
+                Pause
+                ;;
+           "2") case `uname` in
+                "Darwin") brew services stop postgresql  ;;
+                 "Linux") echo not Implemented;;
+                esac
+                Pause
+                ;;
+           "3") case `uname` in
+                "Darwin") brew services list postgresql  ;;
+                 "Linux") echo not Implemented;;
+                esac
+                Pause
+                ;;
+           "4") initPostgres
+                ;;
+           "x") menu=l1_apps
+                ;;
+           esac
+           ;;
+"l2_sqlite") menus ${menu}
+           case $option in
+           "1") 
+                clear
+                echo;echo "Number of test tables in SQLite=${SQLITE_TABLES}"
+                echo "Update:"
+                read NEW_SQLITE_TABLES
+                if [ "${NEW_SQLITE_TABLES}"x = x ]
+                then
+                  echo 
+                else
+                  SQLITE_TABLES=${NEW_SQLITE_TABLES}
+                  setSqliteTables
+                fi
+                Pause
+                ;;
+           "2") 
+                Pause
+                ;;
+           "3") SqliteRemember
+                Pause
+                ;;
+           "4") initSqlite
+                ;;
+           "x") menu=l1_apps
+                ;;
+           esac
+           ;;
+"l3_spooldir") menus ${menu}
+           case $option in
+           "1") submitConnectJob spooldir GDELT_EVENT_produce_csvspooldir source
+                ;;
+           "2") unSubmitConnectJob GDELT_EVENT_produce_csvspooldir spooldir source
+                ;;
+           "3") toggleConnectServer
+                ;;
+           "4") checkStatusConnectJob GDELT_EVENT_produce_csvspooldir
+                ;;
+           "5") listConnectJobs
+                #initPlugin jcustenborder/kafka-connect-spooldir:latest
+                ;;
+           "x") menu=l2_plugins
+                ;;
+          esac
+          ;;
+"l3_bigquerySink") menus ${menu}
+           case $option in
+           "1") submitConnectJob bigquery_sink bigquery_sink sink
+                ;;
+           "2") unSubmitConnectJob bigquery_sink bigquery sink
+                ;;
+           "3") toggleConnectServer
+                ;;
+           "4") checkStatusConnectJob bigquery_sink
+                ;;
+           "5") initPlugin confluentinc/wepay-kafka-connect-bigquery:latest
+                ;;
+           "x") menu=l2_plugins
+                ;;
+          esac
+          ;;
+"l3_elasticSink") menus ${menu}
+           case $option in
+           "1") submitConnectJob elastic elastic_${P_TOPIC_NAME} sink
+                ;;
+           "2") unSubmitConnectJob elastic_${P_TOPIC_NAME} elastic sink
+                ;;
+           "3") toggleConnectServer
+                ;;
+           "4") checkStatusConnectJob elastic_${P_TOPIC_NAME}
+                ;;
+           "5") toggleTopicForElastic
+                ;;
+           "6") cd ~/kibana*
+                printf "${Gre}Kibana starting..${RESET} \n"
+                nohup bin/kibana & 
+                Pause
+                ;;
+           "7") killElastic
+                ;;
+           "7") initPlugin confluentinc/kafka-connect-elasticsearch:latest
+                ;;
+           "x") menu=l2_plugins
+                ;;
+          esac
+          ;;
+"l3_sqliteSource") menus ${menu}
+           case $option in
+           "1") submitConnectJob jdbc_source sqlite_source source
+                ;;
+           "2") unSubmitConnectJob sqlite_source jdbc_source source
+                ;;
+           "3") toggleConnectServer
+                ;;
+           "4") checkStatusConnectJob sqlite_source
+                ;;
+           "5") toggleSqliteConnectMode
+                ;;
+           "6") initPlugin confluentinc/kafka-connect-jdbcsource:latest
+                ;;
+           "x") menu=l2_plugins
+                ;;
+          esac
+          ;;
+"l3_postgresSink") menus ${menu}
+           case $option in
+           "1") submitConnectJob jdbc_sink postgres_sink sink
+                ;;
+           "2") unSubmitConnectJob postgres_sink jdbc_sink sink
+                ;;
+           "3") toggleConnectServer
+                ;;
+           "4") checkStatusConnectJob postgres_sink
+                ;;
+           "5") initPlugin confluentinc/wepay-kafka-connect-jdbc-sink:latest
+                ;;
+           "x") menu=l2_plugins
+                ;;
+          esac
+          ;;
+"l3_mqttSource") menus ${menu}
+           case $option in
+           "1") submitConnectJob mqtt_source mqtt_source source
+                ;;
+           "2") unSubmitConnectJob mqtt_source mqtt_source source
+                ;;
+           "3") toggleConnectServer
+                ;;
+           "4") checkStatusConnectJob mqtt_source
+                ;;
+           "5") initPlugin confluentinc/kafka-connect-mqtt:latest
+                ;;
+           "x") menu=l2_plugins
+                ;;
+          esac
+          ;;
+"l3_mqttSink") menus ${menu}
+           case $option in
+           "1") submitConnectJob mqtt_sink mqtt_sink sink
+                ;;
+           "2") unSubmitConnectJob mqtt_sink mqtt_sink sink
+                ;;
+           "3") toggleConnectServer
+                ;;
+           "4") checkStatusConnectJob mqtt_sink
+                ;;
+           "5") initPlugin confluentinc/kafka-connect-mqtt:latest
+                ;;
+           "x") menu=l2_plugins
+                ;;
+          esac
+          ;;
+"l3_MQSource") menus ${menu}
+           case $option in
+           "1") submitConnectJob mq_source mq_source source
+                ;;
+           "2") unSubmitConnectJob mq_source mq_source source
+                ;;
+           "3") toggleConnectServer
+                ;;
+           "4") checkStatusConnectJob mq_source
+                ;;
+           "5") initPlugin confluentinc/kafka-connect-mqsource:latest
+                ;;
+           "x") menu=l2_plugins
+                ;;
+          esac
+          ;;
+"l3_JdbcSink") menus ${menu}
+           case $option in
+           "1") submitConnectJob jdbc_sink jdbc_sink_${JDBC_TABLE} sink
+                ;;
+           "2") unSubmitConnectJob jdbc_sink_${JDBC_TABLE} jdbc_sink sink
+                ;;
+           "3") toggleConnectServer
+                ;;
+           "4") checkStatusConnectJob jdbc_sink_${JDBC_TABLE}
+                ;;
+           "5") initPlugin confluentinc/kafka-connect-jdbcsink:latest
+                ;;
+           "6") toggleJdbcProperties
+                ;;
+           "x") menu=l2_plugins
+                ;;
+          esac
+          ;;
+"l3_JdbcSource") menus ${menu}
+           case $option in
+           "1") submitConnectJob jdbc_source jdbc_source_${JDBC_TABLE} source
+                ;;
+           "2") unSubmitConnectJob jdbc_source_${JDBC_TABLE} jdbc_source source
+                ;;
+           "3") toggleConnectServer
+                ;;
+           "4") checkStatusConnectJob jdbc_source_${JDBC_TABLE}
+                ;;
+           "5") initPlugin confluentinc/kafka-connect-jdbcsource:latest
+                ;;
+           "6") toggleJdbcSource
+                ;;
+           "x") menu=l2_plugins
+                ;;
+          esac
+          ;;
+"l3_Replicator") menus ${menu}
+           case $option in
+           "1") submitConnectJob replicator replicator sink
+                ;;
+           "2") unSubmitConnectJob replicator replicator sink
+                ;;
+           "3") toggleConnectServer
+                ;;
+           "4") checkStatusConnectJob replicator
+                ;;
+           "5") initPlugin confluentinc/kafka-connect-jdbcsink:latest
+                ;;
+           "6") toggleJdbcProperties
+                ;;
+           "x") menu=l2_plugins
+                ;;
+          esac
+          ;;
+"l2_GdeltSpooldir") menus ${menu}
+           case $option in
+           "1") spooldirProduceFile one.csv
+                ;;
+           "2") setCsvBatchSize
+                ;;
+           "3") setIterations
+                ;;
+           "4") setIntervalSecs
+                ;;
+           "5") autoLoad ${P_INTERVAL_SECS}
+                ;;
+           "x") menu=l1_data
+                ;;
+          esac
+          ;;
+"l2_GdeltPostgres") menus ${menu}
+           case $option in
+           "1") GdeltPostgresCreateEventsTable
+                ;;
+           "2") setCsvBatchSize
+                ;;
+           "3") setIterations
+                ;;
+           "4") setIntervalSecs
+                ;;
+           "5") autoLoad ${P_INTERVAL_SECS}
+                ;;
+           "x") menu=l1_data
+                ;;
+          esac
+          ;;
+"l2_ksqlGdelt") menus ${menu}
+           case $option in
+           "1") runSql createStTopic
+                runSql createStFilterGeo
+                ;;
+           "2") runSql createTbGroupBy
+                ;;
+           "3") runSql reKey1
+                ;;
+           "4") runSql stEnriched
+                ;;
+           "x") menu=l1_ksql
+                ;;
+          esac
+          ;;
+"l1_setup") menus ${menu}
+           case $option in
+           "1") modifyConfluentPropertiesFiles
+                ;;
+           "2") removeUnneededConnectPlugins
+                ;;
+           "3") runBCATests
+                ;;
+           "x") menu=l0_main
+                ;;
+          esac
+          ;;
+esac
+
+
+
+
+done
+
