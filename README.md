@@ -61,7 +61,7 @@ Menu options:
 
 6. "Rebuild Docker Image" to create a new custom docker image for Kafka Connect, which will be used for the next demo run. This must be done before the first run. The docker container version number will be incremente each time this is selected.
 
-7. RUn CDR Load to execute the demo. It typicaally takes 30-60 mins per run. The logged in session should be active and in the foreground .
+7. "Run CDR Load" to execute the demo. It typically takes 30-60 mins per run. The logged in session should be active and in the foreground while the demo is running.
 
 8. Regenerate Confluent Cloud config files recreates the configuration files in ~{WORKDIR}/cloud_delta after re-reading ~/ccloud/.config. This is run automatically each time the menu is re-run.
 
