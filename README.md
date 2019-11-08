@@ -26,6 +26,8 @@ Confluent Cloud connectivity is required, and the topic is created, loaded and t
 
 Extensive log information is extracted for each run in a local dirtectory: ../cdrdemo_run. Edit cdrdemo_runme to change this directory.
 
+
+```
 When you run it, this is what happens:  
        setLogLocation - write logfiles to a destination directory
             setBroker - the only broker option now is Confluent Cloud. We can add Operator later; and Apache Kafka.
@@ -67,7 +69,7 @@ To run the demo, change directory to the location of the script "cdrdemo_runme" 
 
 Enter an Option:
 
-
+```
 Menu options:
 1 "Set CDRs per file" - the number of CDR lines in each CDR data file. CDR data files are created automatically in /var/tmp/queued on the Connect worker pods. Each CDR lines is comma dellimited with 81 attributes. Some are randmonized, most are repeated strings. Each file is processed by one Kafka Connect task so adjust the file size when tuning various batch size configurations for spooldir.
 
