@@ -26,6 +26,26 @@ Confluent Cloud connectivity is required, and the topic is created, loaded and t
 
 Extensive log information is extracted for each run in a local dirtectory: ../cdrdemo_run. Edit cdrdemo_runme to change this directory.
 
+When you run it, this is what happens:  
+       setLogLocation - write logfiles to a destination directory
+            setBroker - the only broker option now is Confluent Cloud. We can add Operator later; and Apache Kafka.
+       destroyCluster - tear down the GKE cluster; in case the prior run didnt complete successfully.
+       deleteCCTopics - connect - delete Kafka Connect topics from the brokers. Fresh topics are used for each demo run.
+       deleteCCTopics - CDR - delete the CDR topic(s) to avoid billable data accumulation on Confluent Cloud between runs
+       deleteCCTopics - _confluent-ksql - re-initialize any streams/tables in kSQL. 
+          makeCluster - build the GKE cluster and the Operator cluster.
+ recreatePortForwards - Recreate port forwards ("kubectl forward") for ssh/logs cmds to the demo pods
+    deleteConnectJobs - delete any Kafka Connect jobs that may remain after failed runs.
+          createTopic - create a new topic for the CDR data
+  streamConnectLogFileMultiplexed - kubectl tail -f the stdio for all connect pods to one file for easier grepping
+     startConnectJobs - start five Kafka Connect jobs on each Worker - so for ten workers, this will start 50 jobs
+          #createKsql - currently commented out
+        checkTestData - Check each worker pod and count how many files are queued/finished/errored
+  getConnectRowsProcessed - summarize the run by grepping the logfile
+       getPodLogfiles - download logfiles from the pods before they are destroyed  destroyCluster
+ 
+
+
 
 To run the demo, change directory to the location of the script "cdrdemo_runme" and run it:
 ./cdrdemo_runme
