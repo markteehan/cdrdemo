@@ -53,37 +53,54 @@ To run the demo, change directory to the location of the script "cdrdemo_runme" 
 ./cdrdemo_runme
 
 
-
          ****************************
          *       CDR Demo           *
          ****************************
 
-1. Set CDRs per file [ 50000 ]
-2. Set number of files [ 300 ]
-3. Toggle Producer Compression [ none ]
-4. Set linger.ms [ 2000 ]
-5. Set  batch.size [ 16384 ]
-6. Rebuild Docker image [ stale ]
-7. Run CDR Load
-8. Regenerate Confluent Cloud config files
+
+Demo:                             Configure:
+ 1.       Run All Steps           c1. CDRs per file [ 50000 ]
+ 2.       Auto-Destroy [Y]        c2. Number of files [ 300 ]
+ 3.       exit                    c3. Producer Compression [ none ]
+                                  c4. linger.ms [ 2000 ]
+Demo Steps:                       c5. batch.size [ 16384 ]
+GKE:
+s1       destroyCluster
+s2          makeCluster
+s3 recreatePortForwards           Docker:
+s4       getPodLogfiles           d1. Rebuild custom docker Images [ stale ]
+
+Confluent:
+s5         deleteTopics
+s6          createTopic
+s7             dropKSQL
+s8           createKSQL
+
+Kafka Connect:
+s9    deleteConnectJobs
+s10    startConnectJobs
 
 Enter an Option:
-
-```
 Menu options:
-1 "Set CDRs per file" - the number of CDR lines in each CDR data file. CDR data files are created automatically in /var/tmp/queued on the Connect worker pods. Each CDR lines is comma dellimited with 81 attributes. Some are randmonized, most are repeated strings. Each file is processed by one Kafka Connect task so adjust the file size when tuning various batch size configurations for spooldir.
+1. "Run all steps" - run a demo, end to end with no pauses
+2. "Auto Destroy" - tear down cluster at the end of the demo
+x. exit (or Control-C)
 
-2 "Set number of files" to set the number of files in /var/tmp/queued. Increasing the number of files extends the duration of each demo run.
+s1-s10 - run/repeat demo steps manually
 
-3 "Toggle Producer Compression" to change the Kafka Connect producer compression algorithm - one of none, zstd, snappy or gzip.
 
-4 Set linger.ms to change the Kafka Connect producer session linger milliseconds
+c1 "Set CDRs per file" - the number of CDR lines in each CDR data file. CDR data files are created automatically in /var/tmp/queued on the Connect worker pods. Each CDR lines is comma dellimited with 81 attributes. Some are randmonized, most are repeated strings. Each file is processed by one Kafka Connect task so adjust the file size when tuning various batch size configurations for spooldir.
 
-5. Set batch.size to change the Kafka Connect producer batch.size
+c2 "Set number of files" to set the number of files in /var/tmp/queued. Increasing the number of files extends the duration of each demo run.
 
-6. "Rebuild Docker Image" to create a new custom docker image for Kafka Connect, which will be used for the next demo run. This must be done before the first run. The docker container version number will be incremente each time this is selected.
+c3 "Toggle Producer Compression" to change the Kafka Connect producer compression algorithm - one of none, zstd, snappy or gzip.
 
-7. "Run CDR Load" to execute the demo. It typically takes 30-60 mins per run. The logged in session should be active and in the foreground while the demo is running.
+c4 Set linger.ms to change the Kafka Connect producer session linger milliseconds
 
-8. Regenerate Confluent Cloud config files recreates the configuration files in ~{WORKDIR}/cloud_delta after re-reading ~/ccloud/.config. This is run automatically each time the menu is re-run.
+c5 Set batch.size to change the Kafka Connect producer batch.size
+
+c6 "Rebuild Docker Image" to create a new custom docker image for Kafka Connect, which will be used for the next demo run. This must be done before the first run. The docker container version number will be incremente each time this is selected.
+
+c7 "Run CDR Load" to execute the demo. It typically takes 30-60 mins per run. The logged in session should be active and in the foreground while the demo is running.
+
 
